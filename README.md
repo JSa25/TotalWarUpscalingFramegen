@@ -8,7 +8,7 @@ generation are being worked on.
 |---|---|---|
 | Total War: ATTILA | Upscaling and Framegen for Attila: [Steam Workshop](https://steamcommunity.com/sharedfiles/filedetails/?id=3828791891) | [Attila Engine Performance Fix](https://github.com/JSa25/AttilaCPUPerfFix) 6.3 or newer |
 
-Each game's in-game part (the code that hands every frame to this helper, the F12 settings panel, the motion vectors
+Each game's in-game part (the code that hands every frame to this helper, the F11 settings panel, the motion vectors
 for units) is part of that game's engine fix and is in its repository; for Attila: `fgbridge.c`, `bridgeprobe.c`,
 `fgmotion.c` and `fgpanel.c` in [JSa25/AttilaCPUPerfFix](https://github.com/JSa25/AttilaCPUPerfFix).
 
