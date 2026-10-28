@@ -48,5 +48,5 @@ under NVIDIA's licences.
 
 See [LICENSE](LICENSE).
 
-This project uses NVIDIA DLSS and NVIDIA Streamline. NVIDIA, GeForce RTX, DLSS and Streamline are trademarks and/or
+This project uses NVIDIA DLSS, NVIDIA Reflex and NVIDIA Streamline. NVIDIA, GeForce RTX, DLSS, Reflex and Streamline are trademarks and/or
 registered trademarks of NVIDIA Corporation. This project is not made or endorsed by NVIDIA.

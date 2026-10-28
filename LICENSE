@@ -18,9 +18,14 @@ This software is provided "as is", without warranty of any kind. The author is n
 damage or data loss arising from its use.
 
 Third-party components keep their own licenses:
-- NVIDIA's Streamline and DLSS files (sl.*.dll, nvngx_dlss.dll, nvngx_dlssg.dll) are distributed with the
-  add-on download, unmodified, under NVIDIA's own licences (included with the download in FrameBridge\licenses).
-  They are NOT covered by this licence, may only be used as part of this mod, and are not in this repository.
+- NVIDIA's Streamline, DLSS and Reflex files (sl.*.dll, nvngx_dlss.dll, nvngx_dlssg.dll) are distributed with the
+  mod downloads, unmodified, under NVIDIA's own licences (included with the downloads in FrameBridge\licenses).
+  They are NOT covered by this licence and are not in this repository. They may only be used as part of these
+  mods; you may not reverse engineer, decompile, disassemble or modify them, remove their copyright notices, or
+  copy or distribute them separately.
 - The helper is compiled against NVIDIA's Streamline headers: MIT licence, Copyright (c) 2023 NVIDIA Corporation
-  (the licence text ships with the add-on as streamline_license.txt).
+  (the licence text ships with the mod downloads as streamline_license.txt). This software contains source code
+  provided by NVIDIA Corporation.
+NVIDIA, GeForce RTX, DLSS, Reflex and Streamline are trademarks and/or registered trademarks of NVIDIA
+Corporation. This project is not made or endorsed by NVIDIA.
 Total War: ATTILA and its code belong to their owners; this repository contains none of the game's files.
