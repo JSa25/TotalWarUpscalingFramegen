@@ -72,6 +72,7 @@ static uint32_t st_presents, st_frames_shown, st_bad_status, st_last_status, st_
 static uint32_t st_shown_hist[6];
 static volatile uint32_t st_shown_total;   // never reset (the bridge panel's shown frame rate)
 static double st_cpu_ms;            // helper CPU time inside p12_present
+static double st_slot_t, st_present_t, st_tick_ms;   // of it (QPC ticks): waiting for the GPU to finish the slot's earlier frame / inside Present
 
 // ---- DLSS Super Resolution (P3b) ----
 static bool sr_on;
@@ -519,7 +520,11 @@ static int present_core(uint32_t n, ID3D12Resource *c12, ID3D12Resource *hud12, 
     queue->Wait(fw, wait_v);
 
     uint32_t slot = n % 3;
+    LARGE_INTEGER t0, t1;
+    QueryPerformanceCounter(&t0);
     wait_value(fs, slot_done[slot], fence_event);
+    QueryPerformanceCounter(&t1);
+    st_slot_t += (t1.QuadPart - t0.QuadPart);
     if (!bridge) collect_ts(slot);
     alloc[slot]->Reset();
     cl->Reset(alloc[slot], nullptr);
@@ -589,7 +594,10 @@ static int present_core(uint32_t n, ID3D12Resource *c12, ID3D12Resource *hud12, 
     slot_done[slot] = signal_v;
 
     slPCLSetMarker(PCLMarker::ePresentStart, tk);
+    QueryPerformanceCounter(&t0);
     HRESULT hr = sc->Present(0, 0);
+    QueryPerformanceCounter(&t1);
+    st_present_t += (t1.QuadPart - t0.QuadPart);
     slPCLSetMarker(PCLMarker::ePresentEnd, tk);
     if (FAILED(hr)) st_present_fail++;
     st_presents++;
@@ -615,6 +623,7 @@ static int present_core(uint32_t n, ID3D12Resource *c12, ID3D12Resource *hud12, 
     if (proof) ctx4->Wait(fence11, signal_v);
     QueryPerformanceCounter(&q1); QueryPerformanceFrequency(&qf);
     st_cpu_ms += (q1.QuadPart - q0.QuadPart) * 1000.0 / qf.QuadPart;   // before Reflex sleep (begin_frame)
+    st_tick_ms = 1000.0 / qf.QuadPart;
     if (!bridge) begin_frame(n + 1);
     return 1;
 }
@@ -639,14 +648,16 @@ extern "C" uint32_t p12_shown_total(void) { return st_shown_total; }
 extern "C" void p12_stats(char *buf, size_t len, int reset)
 {
     snprintf(buf, len, "presents %u, frames shown %u (%.2f per present; per-present count 0:%u 1:%u 2:%u 3:%u 4:%u >4:%u), "
-             "bad status %u (last 0x%x), tag failures %u, present failures %u, mode %u, helper CPU %.3f ms/present, DLSS SR GPU %.3f ms (%u)",
+             "bad status %u (last 0x%x), tag failures %u, present failures %u, mode %u, helper CPU %.3f ms/present "
+             "(waiting for the GPU %.3f, inside Present %.3f), DLSS SR GPU %.3f ms (%u)",
              st_presents, st_frames_shown, st_presents ? (double)st_frames_shown / st_presents : 0,
              st_shown_hist[0], st_shown_hist[1], st_shown_hist[2], st_shown_hist[3], st_shown_hist[4], st_shown_hist[5],
              st_bad_status, st_last_status, st_tag_fail, st_present_fail, fg_frames, st_presents ? st_cpu_ms / st_presents : 0,
+             st_presents ? st_slot_t * st_tick_ms / st_presents : 0, st_presents ? st_present_t * st_tick_ms / st_presents : 0,
              st_dlss_n ? st_dlss_gpu_ms / st_dlss_n : 0, st_dlss_n);
     if (reset) {
         st_presents = st_frames_shown = st_bad_status = st_tag_fail = st_present_fail = 0;
-        st_cpu_ms = st_dlss_gpu_ms = 0; st_dlss_n = 0;
+        st_cpu_ms = st_dlss_gpu_ms = st_slot_t = st_present_t = 0; st_dlss_n = 0;
         memset(st_shown_hist, 0, sizeof st_shown_hist);
     }
 }
