@@ -296,6 +296,15 @@ extern "C" int p12_bridge_init(uint32_t luid_lo, int32_t luid_hi, HWND hwnd, uin
     return 1;
 }
 
+// NVIDIA Reflex's frame limiter (the game's frame cap; 0 = none). It keeps the low-latency mode set in init_tail.
+extern "C" void p12_set_frame_limit(uint32_t us)
+{
+    ReflexOptions ro{};
+    ro.mode = ReflexMode::eLowLatency;
+    ro.frameLimitUs = us;
+    if (slReflexSetOptions(ro) != Result::eOk) fprintf(stderr, "p12: slReflexSetOptions (frame limit %u us) failed\n", us);
+}
+
 extern "C" void p12_set_mode(uint32_t frames_to_generate)
 {
     if (frames_to_generate > fg_max) frames_to_generate = fg_max;   // never more than the GPU allows

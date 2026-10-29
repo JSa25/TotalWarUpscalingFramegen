@@ -673,7 +673,7 @@ static unsigned b_sr_cpu_n;
 static DWORD WINAPI bridge_present_thread(void *arg)
 {
     (void)arg;
-    uint32_t fg = 0xFFFFFFFF;
+    uint32_t fg = 0xFFFFFFFF, limit = 0;
     LARGE_INTEGER last_report = { 0 };
     for (uint32_t n = 0;; n++) {
         uint32_t f;
@@ -701,6 +701,11 @@ static DWORD WINAPI bridge_present_thread(void *arg)
             QueryPerformanceCounter(&last_report);
             fg = bsh->fg_frames;
             p12_set_mode(fg);
+        }
+        if (bsh->frame_limit_us != limit) {   /* the game's frame cap (NVIDIA Reflex limiter) */
+            limit = bsh->frame_limit_us;
+            p12_set_frame_limit(limit);
+            fprintf(stderr, "  frame limit: %s%u us per shown frame (%.1f fps)\n", limit ? "" : "none, ", limit, limit ? 1e6 / limit : 0.0);
         }
         if (!p12_bridge_present(n, n == 0 || bsh->reset, b_frame_sr[n % 8], b_frame_iw[n % 8], b_frame_ih[n % 8])) { bsh->error = 1; b_quit = 1; return 4; }
         bsh->shown = p12_shown_total();

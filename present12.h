@@ -9,6 +9,7 @@ int  p12_init(ID3D11Device *d11, ID3D11DeviceContext *ctx11, HWND hwnd, uint32_t
               const wchar_t *sl_dir, const wchar_t *log_dir);
 void p12_set_camera(const float clip_to_prev[16], const float prev_to_clip[16]);   /* SL convention: row-major, row vectors */
 void p12_set_mode(uint32_t frames_to_generate);   /* 0 = frame generation off, 1 = 2x, 3 = 4x */
+void p12_set_frame_limit(uint32_t us);            /* NVIDIA Reflex frame limit, microseconds per frame; 0 = none */
 int  p12_present(uint32_t frame, ID3D11Texture2D *color, ID3D11Texture2D *depth, ID3D11Texture2D *mvec, int reset);
 void p12_set_sr(int on, uint32_t render_w, uint32_t render_h, float jitter_sign);   /* DLSS SR (Quality) */
 void p12_set_jitter(float x, float y);                 /* this frame's jitter in render pixels (x right, y down) */
