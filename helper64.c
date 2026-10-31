@@ -709,7 +709,7 @@ static unsigned b_sr_cpu_n;
 static DWORD WINAPI bridge_present_thread(void *arg)
 {
     (void)arg;
-    uint32_t fg = 0xFFFFFFFF, limit = 0;
+    uint32_t fg = 0xFFFFFFFF, limit = 0, vsync_off = 0;
     int vrr = -2;
     LARGE_INTEGER last_report = { 0 }, last_vrr = { 0 };
     for (uint32_t n = 0;; n++) {
@@ -747,6 +747,11 @@ static DWORD WINAPI bridge_present_thread(void *arg)
                         v < 0 ? "unknown" : v & 16 ? "G-Sync / VRR on" : "fixed refresh", v);
             }
             last_vrr = now;
+        }
+        if (bsh->vsync_off != vsync_off) {   /* the player's V-Sync choice */
+            vsync_off = bsh->vsync_off;
+            p12_set_vsync_off((int)vsync_off);
+            fprintf(stderr, "  V-Sync: %s\n", vsync_off ? "off (the player's choice: no cap at the refresh rate, frames may tear)" : "on");
         }
         if (bsh->frame_limit_us != limit) {   /* the game's frame cap (NVIDIA Reflex limiter) */
             limit = bsh->frame_limit_us;
@@ -801,7 +806,7 @@ static int bridge_main(int argc, char **argv)
     sh->fg_max = p12_fg_max();   /* the game reads it once helper_ok is set */
     HANDLE pt = CreateThread(NULL, 0, bridge_present_thread, NULL, 0, NULL);
     if (!pt) { sh->error = 1; return 3; }
-    sh->helper_caps = FGB_CAP_PRESET | FGB_CAP_HUD_POST;
+    sh->helper_caps = FGB_CAP_PRESET | FGB_CAP_HUD_POST | FGB_CAP_VSYNC;
     __atomic_store_n(&sh->helper_ok, 1, __ATOMIC_RELEASE);
     uint32_t sr_cfg[4] = { 0, 0, 0, 0 }, sr_prev = 0, scene_prev = 0, b_cuts = 0, b_stalls = 0, cam_logged = 0;
     LARGE_INTEGER b_frame_t = { 0 };

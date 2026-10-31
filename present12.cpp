@@ -60,6 +60,8 @@ static bool fg_ok;
 // window's own process only), so V-Sync is what keeps them whole. With frame generation only where DLSS-G supports it
 // (ProgrammingGuideDLSS_G 22).
 static bool vsync_fg;
+static bool vs_user_off;   // the player turned V-Sync off (the game's settings / F11 panel): no cap, frames may tear
+extern "C" void p12_set_vsync_off(int off) { vs_user_off = off != 0; }
 static HWND p_hwnd;
 static uint32_t st_vsync_on, st_vsync_off;
 // The V-Sync guard: once (Rome 2), with windowed G-Sync and the NVIDIA overlay on, Windows composed the frames and V-Sync
@@ -704,7 +706,7 @@ static int present_core(uint32_t n, ID3D12Resource *c12, ID3D12Resource *hud12, 
 
     slPCLSetMarker(PCLMarker::ePresentStart, tk);
     QueryPerformanceCounter(&t0);
-    UINT sync = !vs_held && (!fg_ok || !fg_frames || vsync_fg) ? 1 : 0;
+    UINT sync = !vs_user_off && !vs_held && (!fg_ok || !fg_frames || vsync_fg) ? 1 : 0;
     (sync ? st_vsync_on : st_vsync_off)++;
     HRESULT hr = sc->Present(sync, 0);
     QueryPerformanceCounter(&t1);

@@ -22,6 +22,7 @@ int  p12_bridge_init(uint32_t luid_lo, int32_t luid_hi, HWND hwnd, uint32_t w, u
 int  p12_bridge_frame(uint32_t frame, int reset, int sr);   /* SR thread: start frame n; with sr, DLSS SR (game 2n+1 -> SR fence n+1) */
 void p12_set_fg_test_limit(uint32_t limit);   /* before init: dev test, 0 none, else the GPU is treated as allowing limit - 1 */
 uint32_t p12_fg_max(void);                    /* after init: generated frames this GPU allows (0 = no frame generation) */
+void p12_set_vsync_off(int off);                 /* the player's choice: present without V-Sync (may tear) */
 int  p12_bridge_present(uint32_t frame, int reset, int sr_done, uint32_t in_w, uint32_t in_h, int hud_post);   /* present thread: game 2n+2 -> FG, present fence n+1; in_w x in_h: the frame's depth / motion vector size */
 uint32_t p12_shown_total(void);   /* frames shown so far, generated ones included */
 void p12_stats(char *buf, size_t len, int reset);
