@@ -117,7 +117,7 @@ static const ViewportHandle viewport{0};
 
 static struct { ID3D11Texture2D *t11; ID3D12Resource *t12; } shared_cache[16];
 
-static uint32_t st_presents, st_frames_shown, st_bad_status, st_last_status, st_tag_fail, st_present_fail;
+static uint32_t st_presents, st_frames_shown, st_bad_status, st_last_status, st_tag_fail, st_present_fail, st_hud_post;
 static uint32_t st_shown_hist[6];
 static volatile uint32_t st_shown_total;   // never reset (the bridge panel's shown frame rate)
 static double st_cpu_ms;            // helper CPU time inside p12_present
@@ -750,10 +750,12 @@ extern "C" int p12_present(uint32_t n, ID3D11Texture2D *color, ID3D11Texture2D *
 
 /* bridge, present thread: frame generation. With SR on this frame the HUD-less image is SR output n % 2. Waits game
    fence 2n+2 (final colour), signals present fence n+1 once frame n's inputs are read. */
-extern "C" int p12_bridge_present(uint32_t n, int reset, int sr_done, uint32_t in_w, uint32_t in_h)
+extern "C" int p12_bridge_present(uint32_t n, int reset, int sr_done, uint32_t in_w, uint32_t in_h, int hud_post)
 {
     br_iw = in_w; br_ih = in_h;
-    return present_core(n, br[0], sr_done ? br[4 + n % 2] : br[1], br[2], br[3], reset, 0, f_game, 2ull * n + 2, f_done, n + 1, sr_done);
+    /* hud_post: the game wrote its own HUD-less image after SR into _hudless (full size: SR output + ReShade's effects) */
+    if (sr_done && hud_post) st_hud_post++;
+    return present_core(n, br[0], sr_done && !hud_post ? br[4 + n % 2] : br[1], br[2], br[3], reset, 0, f_game, 2ull * n + 2, f_done, n + 1, sr_done);
 }
 
 extern "C" uint32_t p12_shown_total(void) { return st_shown_total; }
@@ -762,15 +764,15 @@ extern "C" void p12_stats(char *buf, size_t len, int reset)
 {
     snprintf(buf, len, "presents %u, frames shown %u (%.2f per present; per-present count 0:%u 1:%u 2:%u 3:%u 4:%u >4:%u), "
              "bad status %u (last 0x%x), tag failures %u, present failures %u, mode %u, helper CPU %.3f ms/present "
-             "(waiting for the GPU %.3f, inside Present %.3f), DLSS SR GPU %.3f ms (%u), V-Sync on %u / off %u",
+             "(waiting for the GPU %.3f, inside Present %.3f), DLSS SR GPU %.3f ms (%u), V-Sync on %u / off %u, HUD-less from the game after SR %u",
              st_presents, st_frames_shown, st_presents ? (double)st_frames_shown / st_presents : 0,
              st_shown_hist[0], st_shown_hist[1], st_shown_hist[2], st_shown_hist[3], st_shown_hist[4], st_shown_hist[5],
              st_bad_status, st_last_status, st_tag_fail, st_present_fail, fg_frames, st_presents ? st_cpu_ms / st_presents : 0,
              st_presents ? st_slot_t * st_tick_ms / st_presents : 0, st_presents ? st_present_t * st_tick_ms / st_presents : 0,
-             st_dlss_n ? st_dlss_gpu_ms / st_dlss_n : 0, st_dlss_n, st_vsync_on, st_vsync_off);
+             st_dlss_n ? st_dlss_gpu_ms / st_dlss_n : 0, st_dlss_n, st_vsync_on, st_vsync_off, st_hud_post);
     if (reset) {
         st_presents = st_frames_shown = st_bad_status = st_tag_fail = st_present_fail = 0;
-        st_vsync_on = st_vsync_off = 0;
+        st_vsync_on = st_vsync_off = st_hud_post = 0;
         st_cpu_ms = st_dlss_gpu_ms = st_slot_t = st_present_t = 0; st_dlss_n = 0;
         memset(st_shown_hist, 0, sizeof st_shown_hist);
     }

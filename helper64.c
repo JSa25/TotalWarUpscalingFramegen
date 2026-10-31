@@ -4,6 +4,7 @@
 #define COBJMACROS
 #define INITGUID
 #include <windows.h>
+#include <shellapi.h>
 #include <d3d12.h>
 #include <d3d11.h>
 #include <d3d11on12.h>
@@ -658,6 +659,41 @@ static void bridge_camera(const float *vp, const float *prev_vp, int check)
     }
 }
 
+static void unproject(const float *inv, float x, float y, float z, float *w)   /* NDC -> world */
+{
+    float r[4];
+    for (int i = 0; i < 4; i++) r[i] = inv[i * 4] * x + inv[i * 4 + 1] * y + inv[i * 4 + 2] * z + inv[i * 4 + 3];
+    for (int i = 0; i < 3; i++) w[i] = r[i] / r[3];
+}
+
+/* How far the view jumped since the previous frame, in NDC (2 = the screen's width), for camera cuts (end turn, a jump
+   to a settlement or unit): a new view, not motion, so DLSS must not blend the last frame into it (frame generation
+   shows a ghost of the old view). The ground (plane y = 0, the game's world is y up; the far plane where a ray misses
+   it) under a 3 x 3 grid of screen points, back into the previous frame: the median distance moved, 100 when a point
+   is behind the previous camera. log: the camera's position and direction (checks y up). */
+static float camera_jump(const float *vp, const float *prev_vp, int log)
+{
+    float iv[16], d[9];
+    if (!inverse4(vp, iv)) return 0;
+    for (int i = 0; i < 9; i++) {
+        float x = (i % 3 - 1) * 0.8f, y = (i / 3 - 1) * 0.8f, pn[3], pf[3], p[3], c[4];
+        unproject(iv, x, y, 0, pn);
+        unproject(iv, x, y, 1, pf);
+        float t = pn[1] > 0 && pf[1] < 0 ? pn[1] / (pn[1] - pf[1]) : 1;
+        for (int k = 0; k < 3; k++) p[k] = pn[k] + t * (pf[k] - pn[k]);
+        if (log && i == 4) {
+            float l = sqrtf((pf[0] - pn[0]) * (pf[0] - pn[0]) + (pf[1] - pn[1]) * (pf[1] - pn[1]) + (pf[2] - pn[2]) * (pf[2] - pn[2]));
+            fprintf(stderr, "  bridge camera: at (%.1f %.1f %.1f), looking (%.2f %.2f %.2f), ground %.1f away\n",
+                    pn[0], pn[1], pn[2], (pf[0] - pn[0]) / l, (pf[1] - pn[1]) / l, (pf[2] - pn[2]) / l, t * l);
+        }
+        for (int k = 0; k < 4; k++) c[k] = prev_vp[k * 4] * p[0] + prev_vp[k * 4 + 1] * p[1] + prev_vp[k * 4 + 2] * p[2] + prev_vp[k * 4 + 3];
+        d[i] = c[3] <= 0 ? 100 : hypotf(c[0] / c[3] - x, c[1] / c[3] - y);
+    }
+    for (int i = 1; i < 9; i++)
+        for (int j = i; j > 0 && d[j - 1] > d[j]; j--) { float s = d[j]; d[j] = d[j - 1]; d[j - 1] = s; }
+    return d[4];
+}
+
 /* bridge: two threads. The SR thread (main) starts every frame as soon as the game publishes it (mid-frame SR inputs, or
    the final image when the frame has no HUD-less point) and runs DLSS SR on its own queue; the present thread does frame
    generation and Present, which can block on display pacing without delaying the next frame's SR (AGENT_LOG 96). */
@@ -717,7 +753,7 @@ static DWORD WINAPI bridge_present_thread(void *arg)
             p12_set_frame_limit(limit);
             fprintf(stderr, "  frame limit: %s%u us per shown frame (%.1f fps)\n", limit ? "" : "none, ", limit, limit ? 1e6 / limit : 0.0);
         }
-        if (!p12_bridge_present(n, n == 0 || bsh->reset, b_frame_sr[n % 8], b_frame_iw[n % 8], b_frame_ih[n % 8])) { bsh->error = 1; b_quit = 1; return 4; }
+        if (!p12_bridge_present(n, n == 0 || bsh->reset, b_frame_sr[n % 8], b_frame_iw[n % 8], b_frame_ih[n % 8], (bsh->hud_post >> (n % 32)) & 1)) { bsh->error = 1; b_quit = 1; return 4; }
         bsh->shown = p12_shown_total();
         __atomic_store_n(&bsh->done, n + 1, __ATOMIC_RELEASE);
     }
@@ -765,9 +801,10 @@ static int bridge_main(int argc, char **argv)
     sh->fg_max = p12_fg_max();   /* the game reads it once helper_ok is set */
     HANDLE pt = CreateThread(NULL, 0, bridge_present_thread, NULL, 0, NULL);
     if (!pt) { sh->error = 1; return 3; }
-    sh->helper_caps = FGB_CAP_PRESET;
+    sh->helper_caps = FGB_CAP_PRESET | FGB_CAP_HUD_POST;
     __atomic_store_n(&sh->helper_ok, 1, __ATOMIC_RELEASE);
-    uint32_t sr_cfg[4] = { 0, 0, 0, 0 }, sr_prev = 0;
+    uint32_t sr_cfg[4] = { 0, 0, 0, 0 }, sr_prev = 0, scene_prev = 0, b_cuts = 0, b_stalls = 0, cam_logged = 0;
+    LARGE_INTEGER b_frame_t = { 0 };
     for (uint32_t n = 0;; n++) {
         uint32_t f, s = 0;
         /* frame n starts with its SR inputs (mid-frame) or its final image (Present), whichever comes first */
@@ -777,10 +814,13 @@ static int bridge_main(int argc, char **argv)
             if (f > n || (s = __atomic_load_n(&sh->sr_frames, __ATOMIC_ACQUIRE) > n)) break;
             if (i < 2000) __builtin_ia32_pause(); else WaitForSingleObject(bwake, 1);
         }
+        float vp[16], prev_vp[16];
+        memcpy(vp, (const void *)sh->vp, 64);
+        memcpy(prev_vp, (const void *)sh->prev_vp, 64);
         if (s) {
             /* tell the game now that frame n's SR will come (its GPU then waits for _fsr n+1): it does not have to wait for
                Streamline's CPU work. shortcut: a helper crash between here and the submit hangs the game's GPU (TDR) */
-            p12_set_jitter(sh->jitter_x, sh->jitter_y);   /* before sr_done: the game may write frame n+1's jitter right after */
+            p12_set_jitter(sh->jitter_x, sh->jitter_y);   /* before sr_done: once that is set (vp too) the game may write frame n+1's */
             __atomic_store_n(&sh->sr_done, n + 1, __ATOMIC_RELEASE);
         }
         /* SR on / off and the render size, every frame: with SR switched off no frame has s, and the old render size
@@ -793,10 +833,32 @@ static int bridge_main(int argc, char **argv)
             p12_set_sr(sr_cfg[0], sr_cfg[1], sr_cfg[2], 1);
             sr_prev = 0;
         }
-        bridge_camera(sh->vp, sh->prev_vp, n == 100);
+        bridge_camera(vp, prev_vp, n == 100);
+        /* no history: the first frame, a frame without the scene (menu, loading) and the first one with it again, SR just
+           switched on or changed, a camera cut, a frame long after the previous one (end turn: the game stalls on a frame
+           while the AI moves, then the picture changes with the camera still; a generated frame between the two is a
+           ghost of the old picture). SR on: sh->reset is still the previous frame's here (the game sets it at Present),
+           a frame without SR inputs has no scene */
+        LARGE_INTEGER ft;
+        QueryPerformanceCounter(&ft);
+        double gap_ms = n ? (double)(ft.QuadPart - b_frame_t.QuadPart) * 1000 / qpf.QuadPart : 0;
+        b_frame_t = ft;
+        int scene = s || (!sr_cfg[0] && !sh->reset);
+        int log_cam = scene && n >= 100 && !cam_logged;
+        cam_logged |= log_cam;
+        float jump = scene ? camera_jump(vp, prev_vp, log_cam) : 0;
+        int cut = jump > 0.67f;   /* a third of the screen in one frame */
+        if (cut && b_cuts++ < 50)
+            fprintf(stderr, "  camera cut at frame %u: the view moved %.0f%% of the screen width (no DLSS history)\n", n,
+                    jump >= 100 ? 100.0 : jump * 50);
+        int stall = gap_ms > 100;   /* Streamline resets its frame timer there too */
+        if (stall && !cut && b_stalls++ < 50)
+            fprintf(stderr, "  frame %u came %.0f ms after the previous one (no DLSS history)\n", n, gap_ms);
+        int reset = n == 0 || !scene || !scene_prev || (s && !sr_prev) || cut || stall;
+        scene_prev = scene;
         LARGE_INTEGER s0, s1;
         QueryPerformanceCounter(&s0);
-        if (!p12_bridge_frame(n, n == 0 || (s ? !sr_prev : sh->reset), s)) { sh->error = 1; break; }
+        if (!p12_bridge_frame(n, reset, s)) { sh->error = 1; break; }
         if (s) {
             QueryPerformanceCounter(&s1);
             b_sr_cpu_ms += (double)(s1.QuadPart - s0.QuadPart) * 1000 / qpf.QuadPart; b_sr_cpu_n++;
