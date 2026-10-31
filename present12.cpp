@@ -441,7 +441,9 @@ extern "C" void p12_set_sr(int on, uint32_t render_w, uint32_t render_h, float j
     if (on) fprintf(stderr, "  p12: DLSS preset %c\n", sr_preset == DLSSPreset::eDefault ? '-' : (char)('A' + (int)sr_preset - 1));
     DLSSOptimalSettings best{};
     if (on && slDLSSGetOptimalSettings(o, best) == Result::eOk)
-        fprintf(stderr, "  p12: DLSS Quality for %ux%u: optimal render %ux%u (range %ux%u..%ux%u), we render %ux%u\n",
+        fprintf(stderr, "  p12: DLSS %s for %ux%u: optimal render %ux%u (range %ux%u..%ux%u), we render %ux%u\n",
+                o.mode == DLSSMode::eDLAA ? "DLAA" : o.mode == DLSSMode::eMaxQuality ? "Quality" : o.mode == DLSSMode::eBalanced ? "Balanced"
+                : o.mode == DLSSMode::eMaxPerformance ? "Performance" : "Ultra Performance",
                 width, height, best.optimalRenderWidth, best.optimalRenderHeight, best.renderWidthMin, best.renderHeightMin,
                 best.renderWidthMax, best.renderHeightMax, rw, rh);
     if (slDLSSSetOptions(viewport, o) != Result::eOk) fprintf(stderr, "p12: slDLSSSetOptions failed\n");
