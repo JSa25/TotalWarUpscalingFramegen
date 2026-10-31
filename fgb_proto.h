@@ -13,7 +13,7 @@
 
 #define FGB_PROTO 4
 #define FGB_QUIT 0xFFFFFFFFu
-#define FGB_CAP_PRESET 1u   /* sr_preset is applied (add-on version 2) */
+#define FGB_CAP_PRESET 1u   /* sr_preset is applied (add-on version 5) */
 
 typedef struct {
     uint32_t proto, width, height, format, hwnd, luid_lo;
@@ -38,7 +38,7 @@ typedef struct {
                                            side that does not know it leaves it 0 */
     volatile uint32_t sr_preset;   /* game: DLSS preset for every mode, NVIDIA's number (10..13 = J..M); 0 = NVIDIA's
                                       default per mode. Was padding: an older game side leaves it 0, an older helper
-                                      ignores it */
+                                      ignores it (same place as in Rome 2's block) */
     volatile uint32_t helper_caps; /* helper, before helper_ok: what it supports (FGB_CAP_*). Was padding: an older helper
                                       leaves it 0, so the game can tell the player to update the add-on */
     uint32_t pad1[6];

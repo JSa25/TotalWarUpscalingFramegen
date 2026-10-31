@@ -707,7 +707,7 @@ static DWORD WINAPI bridge_present_thread(void *arg)
             int v = p12_vrr_flags();
             if (v != vrr) {
                 vrr = v;
-                fprintf(stderr, "  display: %s (NVAPI VRR flags %d; the helper's frames do not get windowed G-Sync, DLSS_LOG 50)\n",
+                fprintf(stderr, "  display: %s (NVAPI VRR flags %d; the helper's frames do not get windowed G-Sync, AGENT_LOG 140)\n",
                         v < 0 ? "unknown" : v & 16 ? "G-Sync / VRR on" : "fixed refresh", v);
             }
             last_vrr = now;
@@ -733,8 +733,14 @@ static int bridge_main(int argc, char **argv)
     static const wchar_t *const what[NN] = { L"map", L"wake", L"fence", L"fsr", L"fdone", L"final", L"hudless", L"depth", L"mvec",
                                              L"srout0", L"srout1" };
     for (int i = 0; i < NN; i++) swprintf(names[i], 64, L"Local\\fgb_%lu_%ls", (unsigned long)pid, what[i]);
-    MultiByteToWideChar(CP_ACP, 0, argv[3], -1, sl_dir, MAX_PATH);
-    MultiByteToWideChar(CP_ACP, 0, argv[4], -1, log_dir, MAX_PATH);
+    /* the paths from the wide command line: argv is its ANSI code page copy, '?' for other characters (a folder named in
+       Japanese on a code page 1252 PC: no log, no Streamline) */
+    int wn = 0;
+    wchar_t **wa = CommandLineToArgvW(GetCommandLineW(), &wn);
+    if (!wa || wn < 5) { fprintf(stderr, "helper64 bridge: command line not readable\n"); return 1; }
+    lstrcpynW(sl_dir, wa[3], MAX_PATH);
+    lstrcpynW(log_dir, wa[4], MAX_PATH);
+    LocalFree(wa);
     if (log_dir[0]) {   /* started without a window (CREATE_NO_WINDOW): stats go to <log dir>\fgbridge_helper.log unless stderr is a file or pipe */
         wchar_t lp[MAX_PATH];
         swprintf(lp, MAX_PATH, L"%ls\\fgbridge_helper.log", log_dir);
@@ -757,9 +763,9 @@ static int bridge_main(int argc, char **argv)
     if (!p12_bridge_init(sh->luid_lo, sh->luid_hi, (HWND)(uintptr_t)sh->hwnd, sh->width, sh->height, objs, sl_dir,
                          log_dir[0] ? log_dir : NULL)) { sh->error = 1; return 3; }
     sh->fg_max = p12_fg_max();   /* the game reads it once helper_ok is set */
-    sh->helper_caps = FGB_CAP_PRESET;
     HANDLE pt = CreateThread(NULL, 0, bridge_present_thread, NULL, 0, NULL);
     if (!pt) { sh->error = 1; return 3; }
+    sh->helper_caps = FGB_CAP_PRESET;
     __atomic_store_n(&sh->helper_ok, 1, __ATOMIC_RELEASE);
     uint32_t sr_cfg[4] = { 0, 0, 0, 0 }, sr_prev = 0;
     for (uint32_t n = 0;; n++) {
@@ -774,7 +780,7 @@ static int bridge_main(int argc, char **argv)
         if (s) {
             /* tell the game now that frame n's SR will come (its GPU then waits for _fsr n+1): it does not have to wait for
                Streamline's CPU work. shortcut: a helper crash between here and the submit hangs the game's GPU (TDR) */
-            p12_set_jitter(sh->jitter_x, sh->jitter_y);   /* before sr_done: once that is set the game may write frame n+1's */
+            p12_set_jitter(sh->jitter_x, sh->jitter_y);   /* before sr_done: the game may write frame n+1's jitter right after */
             __atomic_store_n(&sh->sr_done, n + 1, __ATOMIC_RELEASE);
         }
         /* SR on / off and the render size, every frame: with SR switched off no frame has s, and the old render size

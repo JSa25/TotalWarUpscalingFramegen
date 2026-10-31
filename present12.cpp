@@ -19,6 +19,7 @@
 #include <sl_reflex.h>
 #include <sl_pcl.h>
 #include "present12.h"
+enum { sl_on = 1 };
 
 using namespace sl;
 
@@ -53,18 +54,19 @@ static uint32_t width, height, fg_frames;
 // generation an RTX 40 / 50 (fg_ok), and how many frames it may generate comes from DLSSGState::numFramesToGenerateMax
 // (1 = 2x on RTX 40; more on RTX 50). Nothing beyond what Streamline reports is ever turned on.
 static bool fg_ok;
-// V-Sync on (DLSS_LOG 50): with sync interval 0, frames Windows sends straight to the display (independent flip, also
-// with the NVIDIA overlay on a hardware plane) carried DXGI_PRESENT_ALLOW_TEARING and tore; a player saw it. The helper's
-// frames never get windowed G-Sync (NVIDIA's driver gives it to the window's own process only), so V-Sync is what keeps
-// them whole. With frame generation only where DLSS-G supports it (ProgrammingGuideDLSS_G 22).
+// V-Sync on (Rome 2 DLSS_LOG 50, AGENT_LOG 140): with sync interval 0, frames Windows sends straight to the display
+// (independent flip, also with the NVIDIA overlay on a hardware plane) carried DXGI_PRESENT_ALLOW_TEARING and tore; a player
+// saw it with G-Sync in Attila and Rome 2. The helper's frames never get windowed G-Sync (NVIDIA's driver gives it to the
+// window's own process only), so V-Sync is what keeps them whole. With frame generation only where DLSS-G supports it
+// (ProgrammingGuideDLSS_G 22).
 static bool vsync_fg;
 static HWND p_hwnd;
 static uint32_t st_vsync_on, st_vsync_off;
-// The V-Sync guard: once, with windowed G-Sync and the NVIDIA overlay on, Windows composed the frames and V-Sync held them
-// to 75 per second on a 240 Hz screen (each Present waited ~27 ms; DLSS_LOG 50; not reproduced since). When Presents with
+// The V-Sync guard: once (Rome 2), with windowed G-Sync and the NVIDIA overlay on, Windows composed the frames and V-Sync
+// held them to 75 per second on a 240 Hz screen (each Present waited ~27 ms; not reproduced since). When Presents with
 // V-Sync wait longer on average than 1.5 refreshes per frame shown (counted per Present: frame generation can change
 // within the second), two seconds in a row, V-Sync goes off for 30 s (the frames are composed then, and composed frames
-// never tear), then is tried again.
+// never tear), then is tried again. (A one-second version false-triggered at a 4x -> off switch.)
 static bool vs_held;
 static int64_t vs_t0, vs_wait, vs_off_until;
 static uint32_t vs_n, vs_shown, vs_bad;
@@ -180,6 +182,7 @@ static void begin_frame(uint32_t n)
     slPCLSetMarker(PCLMarker::eRenderSubmitStart, *token);
 }
 
+
 static int init_core(const LUID *luid, HWND hwnd, uint32_t w, uint32_t h, const wchar_t *sl_dir, const wchar_t *log_dir)
 {
     {   // NVIDIA only: the adapter the inputs come from, checked with Windows' own DXGI before any NVIDIA file is loaded
@@ -287,6 +290,7 @@ static void init_tail(void)
                                  __uuidof(ID3D12Resource), (void **)&ts_buf);
     queue->GetTimestampFrequency(&ts_freq);
 
+    if (!sl_on) return;
     ReflexOptions ro{};
     ro.mode = ReflexMode::eLowLatency;
     ro.frameLimitUs = 0;   // Reflex limits shown frames, not rendered ones; the test app caps its own rate
@@ -347,9 +351,10 @@ extern "C" int p12_bridge_init(uint32_t luid_lo, int32_t luid_hi, HWND hwnd, uin
     return 1;
 }
 
+// NVIDIA Reflex's frame limiter (the game's frame cap; 0 = none). It keeps the low-latency mode set in init_tail.
 // G-Sync / VRR on the game window's display, from NVIDIA's driver: NvAPI_Disp_GetVRRInfo's flags (bit 0 VRR enabled, 1
 // possible, 2 requested, 3 indicator, 4 display in VRR mode), or -1 when unknown. Function IDs and NV_GET_VRR_INFO_V1's
-// layout from the NVAPI headers in the Streamline SDK (external/nvapi, MIT licence); nvapi64.dll is the driver's own.
+// layout from Rome 2's port (the NVAPI headers, MIT licence); nvapi64.dll is the driver's own.
 extern "C" int p12_vrr_flags(void)
 {
     static int (*by_name)(const char *, uint32_t *), (*vrr_info)(uint32_t, void *);
@@ -374,7 +379,6 @@ extern "C" int p12_vrr_flags(void)
     return vrr_info(id, &v) == 0 ? (int)(v.flags & 31) : -1;
 }
 
-// NVIDIA Reflex's frame limiter (the game's frame cap; 0 = none). It keeps the low-latency mode set in init_tail.
 extern "C" void p12_set_frame_limit(uint32_t us)
 {
     ReflexOptions ro{};
@@ -387,7 +391,7 @@ extern "C" void p12_set_mode(uint32_t frames_to_generate)
 {
     if (frames_to_generate > fg_max) frames_to_generate = fg_max;   // never more than the GPU allows
     fg_frames = frames_to_generate;
-    if (!fg_ok) return;   // no frame generation on this GPU: DLSS-G stays off (its default)
+    if (!fg_ok || !sl_on) return;   // no frame generation on this GPU: DLSS-G stays off (its default); FSR reads fg_frames
     DLSSGOptions o{};
     o.mode = frames_to_generate ? DLSSGMode::eOn : DLSSGMode::eOff;
     o.numFramesToGenerate = frames_to_generate ? frames_to_generate : 1;
@@ -431,6 +435,10 @@ extern "C" void p12_set_sr_preset(uint32_t preset)
 extern "C" void p12_set_sr(int on, uint32_t render_w, uint32_t render_h, float jitter_sign)
 {
     sr_on = on; rw = render_w; rh = render_h; jit_sign = jitter_sign;
+    if (!sl_on) {
+        fprintf(stderr, "  p12: AMD FSR upscaling %s, render %ux%u of %ux%u\n", on ? "on" : "off", rw, rh, width, height);
+        return;
+    }
     DLSSOptions o{};
     float r = (float)render_w / width;   // the game picks the render size per preset (F12 panel); the mode follows it
     o.mode = !on ? DLSSMode::eOff : r >= 0.99f ? DLSSMode::eDLAA : r >= 0.64f ? DLSSMode::eMaxQuality : r >= 0.55f ? DLSSMode::eBalanced
@@ -547,12 +555,15 @@ static void collect_ts(uint32_t slot)   // DLSS GPU time of the frame that last 
    fence n+1. Only this thread makes frame tokens and calls slEvaluateFeature (Streamline: not thread safe). */
 extern "C" int p12_bridge_frame(uint32_t n, int reset, int sr)
 {
-    p_slGetNewFrameToken(tokens[n % 4], &n);
-    FrameToken &tk = *tokens[n % 4];
-    slPCLSetMarker(PCLMarker::eSimulationStart, tk);
-    slPCLSetMarker(PCLMarker::eSimulationEnd, tk);
-    slPCLSetMarker(PCLMarker::eRenderSubmitStart, tk);
-    set_constants(tk, reset);
+    FrameToken *tk = nullptr;
+    if (sl_on) {
+        p_slGetNewFrameToken(tokens[n % 4], &n);
+        tk = tokens[n % 4];
+        slPCLSetMarker(PCLMarker::eSimulationStart, *tk);
+        slPCLSetMarker(PCLMarker::eSimulationEnd, *tk);
+        slPCLSetMarker(PCLMarker::eRenderSubmitStart, *tk);
+        set_constants(*tk, reset);
+    }
     if (!sr) return 1;
     uint32_t slot = n % 3;
     wait_value(f_sr, sr_slot_done[slot], sr_event);
@@ -582,10 +593,10 @@ extern "C" int p12_bridge_frame(uint32_t n, int reset, int sr)
         ResourceTag(&rin, kBufferTypeScalingInputColor, ResourceLifecycle::eValidUntilEvaluate, &in_ext),
         ResourceTag(&rout, kBufferTypeScalingOutputColor, ResourceLifecycle::eValidUntilEvaluate, &out_ext),
     };
-    if (p_slSetTagForFrame(tk, viewport, tags, 4, (CommandBuffer *)c) != Result::eOk) st_tag_fail++;
+    if (sl_on && p_slSetTagForFrame(*tk, viewport, tags, 4, (CommandBuffer *)c) != Result::eOk) st_tag_fail++;
     c->EndQuery(ts_heap, D3D12_QUERY_TYPE_TIMESTAMP, slot * 2);
     const BaseStructure *inputs[] = { &viewport };
-    if (p_slEvaluateFeature(kFeatureDLSS, tk, inputs, 1, (CommandBuffer *)c) != Result::eOk) st_tag_fail++;
+    if (p_slEvaluateFeature(kFeatureDLSS, *tk, inputs, 1, (CommandBuffer *)c) != Result::eOk) st_tag_fail++;
     c->EndQuery(ts_heap, D3D12_QUERY_TYPE_TIMESTAMP, slot * 2 + 1);
     c->ResolveQueryData(ts_heap, D3D12_QUERY_TYPE_TIMESTAMP, slot * 2, 2, ts_buf, slot * 16);
     ts_pending[slot] = true;
@@ -735,6 +746,7 @@ extern "C" int p12_present(uint32_t n, ID3D11Texture2D *color, ID3D11Texture2D *
     if (!c12 || !d12r || !m12) { fprintf(stderr, "p12: cannot open shared inputs\n"); return 0; }
     return present_core(n, c12, c12, d12r, m12, reset, 1, fence12, 2ull * n + 1, fence12, 2ull * n + 2, 0);
 }
+
 
 /* bridge, present thread: frame generation. With SR on this frame the HUD-less image is SR output n % 2. Waits game
    fence 2n+2 (final colour), signals present fence n+1 once frame n's inputs are read. */
