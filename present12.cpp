@@ -53,6 +53,53 @@ static uint32_t width, height, fg_frames;
 // generation an RTX 40 / 50 (fg_ok), and how many frames it may generate comes from DLSSGState::numFramesToGenerateMax
 // (1 = 2x on RTX 40; more on RTX 50). Nothing beyond what Streamline reports is ever turned on.
 static bool fg_ok;
+// V-Sync on (DLSS_LOG 50): with sync interval 0, frames Windows sends straight to the display (independent flip, also
+// with the NVIDIA overlay on a hardware plane) carried DXGI_PRESENT_ALLOW_TEARING and tore; a player saw it. The helper's
+// frames never get windowed G-Sync (NVIDIA's driver gives it to the window's own process only), so V-Sync is what keeps
+// them whole. With frame generation only where DLSS-G supports it (ProgrammingGuideDLSS_G 22).
+static bool vsync_fg;
+static HWND p_hwnd;
+static uint32_t st_vsync_on, st_vsync_off;
+// The V-Sync guard: once, with windowed G-Sync and the NVIDIA overlay on, Windows composed the frames and V-Sync held them
+// to 75 per second on a 240 Hz screen (each Present waited ~27 ms; DLSS_LOG 50; not reproduced since). When Presents with
+// V-Sync wait longer on average than 1.5 refreshes per frame shown (counted per Present: frame generation can change
+// within the second), two seconds in a row, V-Sync goes off for 30 s (the frames are composed then, and composed frames
+// never tear), then is tried again.
+static bool vs_held;
+static int64_t vs_t0, vs_wait, vs_off_until;
+static uint32_t vs_n, vs_shown, vs_bad;
+static double vs_refresh_ms(void)
+{
+    MONITORINFOEXW mi{};
+    DEVMODEW dm{};
+    mi.cbSize = sizeof mi; dm.dmSize = sizeof dm;
+    HMONITOR m = p_hwnd ? MonitorFromWindow(p_hwnd, MONITOR_DEFAULTTONEAREST) : nullptr;
+    if (!m || !GetMonitorInfoW(m, (MONITORINFO *)&mi) || !EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm) ||
+        dm.dmDisplayFrequency < 2) return 0;
+    return 1000.0 / dm.dmDisplayFrequency;
+}
+static void vsync_guard(UINT sync, int64_t now, int64_t waited)
+{
+    LARGE_INTEGER f;
+    QueryPerformanceFrequency(&f);
+    if (vs_held) {
+        if (now < vs_off_until) return;
+        vs_held = false; vs_t0 = now; vs_wait = 0; vs_n = vs_shown = vs_bad = 0;
+        fprintf(stderr, "  p12: V-Sync on again (30 s passed)\n");
+        return;
+    }
+    if (!sync) return;
+    vs_wait += waited; vs_n++; vs_shown += fg_frames + 1;
+    if (now - vs_t0 < f.QuadPart) return;
+    double avg_ms = (double)vs_wait * 1000.0 / f.QuadPart / vs_n, refresh = vs_refresh_ms(), limit = 1.5 * refresh * vs_shown / vs_n;
+    vs_bad = refresh > 0 && vs_n >= 10 && avg_ms > limit ? vs_bad + 1 : 0;
+    if (vs_bad >= 2) {
+        vs_held = true; vs_off_until = now + 30 * f.QuadPart; vs_bad = 0;
+        fprintf(stderr, "  p12: V-Sync held the frames back (each Present waited %.1f ms, limit %.1f ms at %.0f Hz) - V-Sync off for 30 s "
+                        "(Windows composes the frames then; composed frames never tear)\n", avg_ms, limit, 1000.0 / refresh);
+    }
+    vs_t0 = now; vs_wait = 0; vs_n = vs_shown = 0;
+}
 static uint32_t fg_max, fg_test_limit;   // test limit: 0 none, else the GPU is treated as allowing limit - 1
 extern "C" void p12_set_fg_test_limit(uint32_t limit) { fg_test_limit = limit; }
 extern "C" uint32_t p12_fg_max(void) { return fg_max; }
@@ -209,14 +256,18 @@ static int init_core(const LUID *luid, HWND hwnd, uint32_t w, uint32_t h, const 
     IDXGISwapChain1 *sc1;
     hr = fac->CreateSwapChainForHwnd(queue, hwnd, &d, nullptr, nullptr, &sc1);
     if (FAILED(hr)) { fprintf(stderr, "p12: CreateSwapChainForHwnd 0x%08lx\n", hr); return 0; }
+    p_hwnd = hwnd;
     fac->MakeWindowAssociation(hwnd, DXGI_MWA_NO_WINDOW_CHANGES | DXGI_MWA_NO_ALT_ENTER);
     sc1->QueryInterface(__uuidof(IDXGISwapChain3), (void **)&sc);
     for (uint32_t i = 0; i < 3; i++) sc->GetBuffer(i, __uuidof(ID3D12Resource), (void **)&bufs[i]);
     width = w; height = h;
     if (fg_ok) {   // how many generated frames this GPU allows; 4x (3 generated) is the most offered here
         DLSSGState st{};
-        fg_max = slDLSSGGetState(viewport, st, nullptr) == Result::eOk && st.numFramesToGenerateMax ? st.numFramesToGenerateMax : 1;
+        bool got = slDLSSGGetState(viewport, st, nullptr) == Result::eOk;
+        fg_max = got && st.numFramesToGenerateMax ? st.numFramesToGenerateMax : 1;
         if (fg_max > 3) fg_max = 3;
+        vsync_fg = got && st.bIsVsyncSupportAvailable == Boolean::eTrue;
+        fprintf(stderr, "  p12: V-Sync with frame generation: %s\n", vsync_fg ? "supported" : "not supported (frame generation presents without it)");
     }
     if (fg_test_limit && fg_max > fg_test_limit - 1) fg_max = fg_test_limit - 1;
     fprintf(stderr, "  p12: frame generation allowed: %s%s\n", !fg_max ? "no" : fg_max == 1 ? "2x" : fg_max == 2 ? "up to 3x" : "up to 4x",
@@ -296,6 +347,33 @@ extern "C" int p12_bridge_init(uint32_t luid_lo, int32_t luid_hi, HWND hwnd, uin
     return 1;
 }
 
+// G-Sync / VRR on the game window's display, from NVIDIA's driver: NvAPI_Disp_GetVRRInfo's flags (bit 0 VRR enabled, 1
+// possible, 2 requested, 3 indicator, 4 display in VRR mode), or -1 when unknown. Function IDs and NV_GET_VRR_INFO_V1's
+// layout from the NVAPI headers in the Streamline SDK (external/nvapi, MIT licence); nvapi64.dll is the driver's own.
+extern "C" int p12_vrr_flags(void)
+{
+    static int (*by_name)(const char *, uint32_t *), (*vrr_info)(uint32_t, void *);
+    static bool tried;
+    if (!tried) {
+        tried = true;
+        HMODULE m = LoadLibraryW(L"nvapi64.dll");
+        auto qi = m ? (void *(*)(uint32_t))(void *)GetProcAddress(m, "nvapi_QueryInterface") : nullptr;
+        auto init = qi ? (int (*)(void))qi(0x0150e828) : nullptr;   // NvAPI_Initialize
+        if (init && init() == 0) {
+            by_name = (int (*)(const char *, uint32_t *))qi(0xae457190);   // NvAPI_DISP_GetDisplayIdByDisplayName
+            vrr_info = (int (*)(uint32_t, void *))qi(0xdf8fda57);        // NvAPI_Disp_GetVRRInfo
+        }
+    }
+    MONITORINFOEXA mi{};
+    mi.cbSize = sizeof mi;
+    HMONITOR mon = p_hwnd ? MonitorFromWindow(p_hwnd, MONITOR_DEFAULTTONEAREST) : nullptr;
+    uint32_t id;
+    if (!by_name || !vrr_info || !mon || !GetMonitorInfoA(mon, &mi) || by_name(mi.szDevice, &id) != 0) return -1;
+    struct { uint32_t version, flags, reserved[4]; } v{};
+    v.version = sizeof v | 1u << 16;   // NV_GET_VRR_INFO_VER1
+    return vrr_info(id, &v) == 0 ? (int)(v.flags & 31) : -1;
+}
+
 // NVIDIA Reflex's frame limiter (the game's frame cap; 0 = none). It keeps the low-latency mode set in init_tail.
 extern "C" void p12_set_frame_limit(uint32_t us)
 {
@@ -343,6 +421,13 @@ static void barrier(ID3D12Resource *r, D3D12_RESOURCE_STATES a, D3D12_RESOURCE_S
     cl->ResourceBarrier(1, &rb);
 }
 
+static DLSSPreset sr_preset = DLSSPreset::eDefault;
+extern "C" void p12_set_sr_preset(uint32_t preset)
+{
+    // from the game's memory: J, K, L, M only (the others are deprecated or fall back to the default anyway)
+    sr_preset = preset >= 10 && preset <= 13 ? (DLSSPreset)preset : DLSSPreset::eDefault;
+}
+
 extern "C" void p12_set_sr(int on, uint32_t render_w, uint32_t render_h, float jitter_sign)
 {
     sr_on = on; rw = render_w; rh = render_h; jit_sign = jitter_sign;
@@ -352,11 +437,11 @@ extern "C" void p12_set_sr(int on, uint32_t render_w, uint32_t render_h, float j
            : r >= 0.45f ? DLSSMode::eMaxPerformance : DLSSMode::eUltraPerformance;
     o.outputWidth = width; o.outputHeight = height;
     o.colorBuffersHDR = Boolean::eFalse;   // the test scene is plain 8-bit colour
+    o.dlaaPreset = o.qualityPreset = o.balancedPreset = o.performancePreset = o.ultraPerformancePreset = sr_preset;
+    if (on) fprintf(stderr, "  p12: DLSS preset %c\n", sr_preset == DLSSPreset::eDefault ? '-' : (char)('A' + (int)sr_preset - 1));
     DLSSOptimalSettings best{};
     if (on && slDLSSGetOptimalSettings(o, best) == Result::eOk)
-        fprintf(stderr, "  p12: DLSS %s for %ux%u: optimal render %ux%u (range %ux%u..%ux%u), we render %ux%u\n",
-                o.mode == DLSSMode::eDLAA ? "DLAA" : o.mode == DLSSMode::eMaxQuality ? "Quality" : o.mode == DLSSMode::eBalanced ? "Balanced"
-                : o.mode == DLSSMode::eMaxPerformance ? "Performance" : "Ultra Performance",
+        fprintf(stderr, "  p12: DLSS Quality for %ux%u: optimal render %ux%u (range %ux%u..%ux%u), we render %ux%u\n",
                 width, height, best.optimalRenderWidth, best.optimalRenderHeight, best.renderWidthMin, best.renderHeightMin,
                 best.renderWidthMax, best.renderHeightMax, rw, rh);
     if (slDLSSSetOptions(viewport, o) != Result::eOk) fprintf(stderr, "p12: slDLSSSetOptions failed\n");
@@ -606,9 +691,12 @@ static int present_core(uint32_t n, ID3D12Resource *c12, ID3D12Resource *hud12, 
 
     slPCLSetMarker(PCLMarker::ePresentStart, tk);
     QueryPerformanceCounter(&t0);
-    HRESULT hr = sc->Present(0, 0);
+    UINT sync = !vs_held && (!fg_ok || !fg_frames || vsync_fg) ? 1 : 0;
+    (sync ? st_vsync_on : st_vsync_off)++;
+    HRESULT hr = sc->Present(sync, 0);
     QueryPerformanceCounter(&t1);
     st_present_t += (t1.QuadPart - t0.QuadPart);
+    vsync_guard(sync, t1.QuadPart, t1.QuadPart - t0.QuadPart);
     slPCLSetMarker(PCLMarker::ePresentEnd, tk);
     if (FAILED(hr)) st_present_fail++;
     st_presents++;
@@ -660,14 +748,15 @@ extern "C" void p12_stats(char *buf, size_t len, int reset)
 {
     snprintf(buf, len, "presents %u, frames shown %u (%.2f per present; per-present count 0:%u 1:%u 2:%u 3:%u 4:%u >4:%u), "
              "bad status %u (last 0x%x), tag failures %u, present failures %u, mode %u, helper CPU %.3f ms/present "
-             "(waiting for the GPU %.3f, inside Present %.3f), DLSS SR GPU %.3f ms (%u)",
+             "(waiting for the GPU %.3f, inside Present %.3f), DLSS SR GPU %.3f ms (%u), V-Sync on %u / off %u",
              st_presents, st_frames_shown, st_presents ? (double)st_frames_shown / st_presents : 0,
              st_shown_hist[0], st_shown_hist[1], st_shown_hist[2], st_shown_hist[3], st_shown_hist[4], st_shown_hist[5],
              st_bad_status, st_last_status, st_tag_fail, st_present_fail, fg_frames, st_presents ? st_cpu_ms / st_presents : 0,
              st_presents ? st_slot_t * st_tick_ms / st_presents : 0, st_presents ? st_present_t * st_tick_ms / st_presents : 0,
-             st_dlss_n ? st_dlss_gpu_ms / st_dlss_n : 0, st_dlss_n);
+             st_dlss_n ? st_dlss_gpu_ms / st_dlss_n : 0, st_dlss_n, st_vsync_on, st_vsync_off);
     if (reset) {
         st_presents = st_frames_shown = st_bad_status = st_tag_fail = st_present_fail = 0;
+        st_vsync_on = st_vsync_off = 0;
         st_cpu_ms = st_dlss_gpu_ms = st_slot_t = st_present_t = 0; st_dlss_n = 0;
         memset(st_shown_hist, 0, sizeof st_shown_hist);
     }

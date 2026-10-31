@@ -674,7 +674,8 @@ static DWORD WINAPI bridge_present_thread(void *arg)
 {
     (void)arg;
     uint32_t fg = 0xFFFFFFFF, limit = 0;
-    LARGE_INTEGER last_report = { 0 };
+    int vrr = -2;
+    LARGE_INTEGER last_report = { 0 }, last_vrr = { 0 };
     for (uint32_t n = 0;; n++) {
         uint32_t f;
         for (int i = 0; __atomic_load_n(&b_started, __ATOMIC_ACQUIRE) <= n || (f = __atomic_load_n(&bsh->frames, __ATOMIC_ACQUIRE)) <= n ||
@@ -701,6 +702,15 @@ static DWORD WINAPI bridge_present_thread(void *arg)
             QueryPerformanceCounter(&last_report);
             fg = bsh->fg_frames;
             p12_set_mode(fg);
+        }
+        if (now.QuadPart - last_vrr.QuadPart > qpf.QuadPart) {   /* G-Sync on the game's display, for bug reports only */
+            int v = p12_vrr_flags();
+            if (v != vrr) {
+                vrr = v;
+                fprintf(stderr, "  display: %s (NVAPI VRR flags %d; the helper's frames do not get windowed G-Sync, DLSS_LOG 50)\n",
+                        v < 0 ? "unknown" : v & 16 ? "G-Sync / VRR on" : "fixed refresh", v);
+            }
+            last_vrr = now;
         }
         if (bsh->frame_limit_us != limit) {   /* the game's frame cap (NVIDIA Reflex limiter) */
             limit = bsh->frame_limit_us;
@@ -747,10 +757,11 @@ static int bridge_main(int argc, char **argv)
     if (!p12_bridge_init(sh->luid_lo, sh->luid_hi, (HWND)(uintptr_t)sh->hwnd, sh->width, sh->height, objs, sl_dir,
                          log_dir[0] ? log_dir : NULL)) { sh->error = 1; return 3; }
     sh->fg_max = p12_fg_max();   /* the game reads it once helper_ok is set */
+    sh->helper_caps = FGB_CAP_PRESET;
     HANDLE pt = CreateThread(NULL, 0, bridge_present_thread, NULL, 0, NULL);
     if (!pt) { sh->error = 1; return 3; }
     __atomic_store_n(&sh->helper_ok, 1, __ATOMIC_RELEASE);
-    uint32_t sr_cfg[3] = { 0, 0, 0 }, sr_prev = 0;
+    uint32_t sr_cfg[4] = { 0, 0, 0, 0 }, sr_prev = 0;
     for (uint32_t n = 0;; n++) {
         uint32_t f, s = 0;
         /* frame n starts with its SR inputs (mid-frame) or its final image (Present), whichever comes first */
@@ -763,15 +774,16 @@ static int bridge_main(int argc, char **argv)
         if (s) {
             /* tell the game now that frame n's SR will come (its GPU then waits for _fsr n+1): it does not have to wait for
                Streamline's CPU work. shortcut: a helper crash between here and the submit hangs the game's GPU (TDR) */
+            p12_set_jitter(sh->jitter_x, sh->jitter_y);   /* before sr_done: once that is set the game may write frame n+1's */
             __atomic_store_n(&sh->sr_done, n + 1, __ATOMIC_RELEASE);
-            p12_set_jitter(sh->jitter_x, sh->jitter_y);
         }
         /* SR on / off and the render size, every frame: with SR switched off no frame has s, and the old render size
            would stay on the frame generation inputs (and their motion vector scale) */
         uint32_t rw = sh->render_w, rh = sh->render_h;   /* from the game's memory: within the shared textures */
         if (!rw || rw > sh->width || !rh || rh > sh->height) { rw = sh->width; rh = sh->height; }
-        if (sh->sr_on != sr_cfg[0] || rw != sr_cfg[1] || rh != sr_cfg[2]) {
-            sr_cfg[0] = sh->sr_on; sr_cfg[1] = rw; sr_cfg[2] = rh;
+        if (sh->sr_on != sr_cfg[0] || rw != sr_cfg[1] || rh != sr_cfg[2] || sh->sr_preset != sr_cfg[3]) {
+            sr_cfg[0] = sh->sr_on; sr_cfg[1] = rw; sr_cfg[2] = rh; sr_cfg[3] = sh->sr_preset;
+            p12_set_sr_preset(sr_cfg[3]);
             p12_set_sr(sr_cfg[0], sr_cfg[1], sr_cfg[2], 1);
             sr_prev = 0;
         }
