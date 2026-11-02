@@ -42,7 +42,23 @@ You need:
 
 Then run `build_helper.bat`. The helper lands in `build\helper64.exe`. The build is reproducible: with the same
 llvm-mingw and SDK versions you get exactly the file in the download (compare
-`certutil -hashfile build\helper64.exe SHA256` with the `SHA256SUMS.txt` in the download).
+`certutil -hashfile build\helper64.exe SHA256` with `helper64.exe.sha256` here and the `SHA256SUMS.txt` in the download).
+
+GitHub builds it too: the [Build workflow](.github/workflows/build.yml) downloads exactly these versions (each pinned by
+its SHA-256; the FSR headers are listed in `fsr_sdk_headers.sha256`), runs `build_helper.bat` and fails unless the
+helper's SHA-256 equals `helper64.exe.sha256`. A tag `helper-v<N>` publishes a [release](../../releases) with that
+`helper64.exe` and its SHA-256; it is the file both mods ship.
+
+### Changing the helper
+
+Attila and Rome 2 ship the same helper, and it comes only from this repository's releases:
+1. Change the source here first: merge each game's changes onto this tree (a three-way merge, so the other game's
+   comments stay), and put the new build's SHA-256 in `helper64.exe.sha256` in the same commit.
+2. Push; the Build workflow must be green. Check its `helper64` artifact on VirusTotal (Microsoft's line must be
+   undetected) before tagging.
+3. Tag `helper-v<N+1>` and push the tag; the workflow publishes the release.
+4. In both mods set `dlss/package/helper_release.txt` to `helper-v<N+1> <SHA-256>`; their `tools/pack_framebridge.sh`
+   downloads that release's `helper64.exe` and refuses to pack any other file.
 
 NVIDIA's files (the Streamline and DLSS DLLs) and AMD's (the three signed `amd_fidelityfx_*_dx12.dll`) are not in this
 repository; they come with the mod downloads, unmodified, under NVIDIA's licences and the AMD FSR SDK's MIT licence.
