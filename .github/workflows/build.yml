@@ -1,0 +1,95 @@
+# Builds helper64.exe from this repository on GitHub's own machine, so nobody has to trust a build made on the
+# author's PC. The build is reproducible: it fails unless the SHA-256 equals helper64.exe.sha256, the helper both
+# mods (Attila and Rome 2) ship. Pushing a tag helper-v<N> publishes a GitHub Release with helper64.exe and its SHA-256.
+# Only helper64.exe is published: NVIDIA's and AMD's DLLs come with the mod downloads under their own licences.
+name: Build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write      # create the release on a helper-v tag
+  id-token: write      # signed build provenance (attestation)
+  attestations: write
+  artifact-metadata: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download the compiler (llvm-mingw 20261006) and NVIDIA's Streamline SDK 2.14.16
+        shell: pwsh
+        run: |
+          # pinned versions and checksums, so the build always uses exactly these files
+          $files = @(
+            @{ url = 'https://github.com/mstorsjo/llvm-mingw/releases/download/20261006/llvm-mingw-20261006-ucrt-x86_64.zip'
+               sha = '317492c456aa27ee607a5919f1d2d38dcdc1112516a24d0bf4b00d078f52d17a'; out = 'llvm.zip' },
+            @{ url = 'https://github.com/NVIDIA-RTX/Streamline/releases/download/v2.14.16/streamline-sdk-v2.14.16.zip'
+               sha = '32041e51db0cab709a271b72a352281b690c2abbd669a827809401a5dd23956b'; out = 'sl.zip' }
+          )
+          foreach ($f in $files) {
+            Invoke-WebRequest $f.url -OutFile "$env:RUNNER_TEMP\$($f.out)"
+            $got = (Get-FileHash "$env:RUNNER_TEMP\$($f.out)" -Algorithm SHA256).Hash.ToLower()
+            if ($got -ne $f.sha) { throw "$($f.out): checksum $got does not match $($f.sha)" }
+          }
+          Expand-Archive "$env:RUNNER_TEMP\llvm.zip" "$env:RUNNER_TEMP\llvm"
+          Add-Content $env:GITHUB_PATH "$env:RUNNER_TEMP\llvm\llvm-mingw-20261006-ucrt-x86_64\bin"
+          # only the headers are needed from the 276 MB SDK
+          New-Item -ItemType Directory "$env:RUNNER_TEMP\sl" | Out-Null
+          tar -xf "$env:RUNNER_TEMP\sl.zip" -C "$env:RUNNER_TEMP\sl" include
+          "STREAMLINE=$env:RUNNER_TEMP\sl" >> $env:GITHUB_ENV
+
+      - name: Download the AMD FSR SDK 2.4.0 headers (tag v2.4.0, commit 7539ae8b)
+        shell: bash
+        run: |
+          # each header pinned by its SHA-256 in fsr_sdk_headers.sha256
+          base=https://raw.githubusercontent.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/7539ae8b6568ad29ed78a753404351daf3b5cca7/Kits/FidelityFX
+          ffx="$RUNNER_TEMP/ffx"
+          tr -d '\r' < fsr_sdk_headers.sha256 | while read -r sha path; do
+            mkdir -p "$ffx/$(dirname "$path")"
+            curl -sSfL "$base/$path" -o "$ffx/$path"
+            got=$(sha256sum "$ffx/$path" | cut -c1-64)
+            [ "$got" = "$sha" ] || { echo "$path: checksum $got does not match $sha"; exit 1; }
+          done
+          echo "FFX=$(cygpath -w "$ffx")" >> "$GITHUB_ENV"
+
+      - name: Build
+        shell: cmd
+        run: build_helper.bat
+
+      - name: SHA-256, check against helper64.exe.sha256
+        shell: pwsh
+        run: |
+          $h = (Get-FileHash build\helper64.exe -Algorithm SHA256).Hash.ToLower()
+          $want = (Get-Content helper64.exe.sha256 -Raw).Trim().Split()[0].ToLower()
+          "SHA-256 of helper64.exe: $h"
+          "### helper64.exe`nSHA-256: ``$h``" | Out-File $env:GITHUB_STEP_SUMMARY -Append
+          # a source change that changes the helper must update helper64.exe.sha256 in the same commit
+          if ($h -ne $want) { throw "the build ($h) does not match helper64.exe.sha256 ($want)" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: helper64
+          path: build/helper64.exe
+
+      - name: Attest build provenance
+        if: github.event_name != 'pull_request'
+        uses: actions/attest@v4
+        with:
+          subject-path: build/helper64.exe
+
+      - name: Publish the release (tag helper-v<N>)
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/helper-v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = '${{ github.ref_name }}'
+          $h = (Get-FileHash build\helper64.exe -Algorithm SHA256).Hash.ToLower()
+          "$h *helper64.exe" | Out-File -Encoding ascii build\helper64.exe.sha256
+          $notes = "helper64.exe built from $env:GITHUB_SHA by this repository's Build workflow (run $env:GITHUB_RUN_ID).`n`nSHA-256: ``$h```n`nBoth mods (Upscaling and Framegen for Attila and for Rome II) ship exactly this file. NVIDIA's and AMD's DLLs are not included; they come with the mod downloads."
+          gh release create $tag build\helper64.exe build\helper64.exe.sha256 --title "Helper $tag" --notes $notes
