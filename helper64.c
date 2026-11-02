@@ -636,6 +636,7 @@ static int inverse4(const float *m, float *out)   /* Gauss-Jordan, row-major */
 static void bridge_camera(const float *vp, const float *prev_vp, int check)
 {
     float iv[16], ip[16], c2p[16], p2c[16], t1[16], t2[16];
+    p12_set_view(vp);
     if (!inverse4(vp, iv) || !inverse4(prev_vp, ip)) return;
     for (int i = 0; i < 4; i++)
         for (int j = 0; j < 4; j++) {
@@ -700,6 +701,7 @@ static float camera_jump(const float *vp, const float *prev_vp, int log)
 static FgbShared *bsh;
 static HANDLE bwake, bwake2, bgame;   /* auto-reset events: one per thread, the game sets both */
 static volatile uint32_t b_started;   /* SR thread: frames started (p12_bridge_frame done for frame n when > n) */
+static uint32_t b_n0;   /* the first frame: 0, or where the helper before this one stopped (F11 switch, FGB_CAP_RESTART) */
 static volatile uint32_t b_quit;
 static uint8_t b_frame_sr[8];         /* frame n had DLSS SR (index n % 8) */
 static uint32_t b_frame_iw[8], b_frame_ih[8];   /* frame n's depth / motion vector size (render size with SR on) */
@@ -710,9 +712,8 @@ static DWORD WINAPI bridge_present_thread(void *arg)
 {
     (void)arg;
     uint32_t fg = 0xFFFFFFFF, limit = 0, vsync_off = 0;
-    int vrr = -2;
-    LARGE_INTEGER last_report = { 0 }, last_vrr = { 0 };
-    for (uint32_t n = 0;; n++) {
+    LARGE_INTEGER last_report = { 0 };
+    for (uint32_t n = b_n0;; n++) {
         uint32_t f;
         for (int i = 0; __atomic_load_n(&b_started, __ATOMIC_ACQUIRE) <= n || (f = __atomic_load_n(&bsh->frames, __ATOMIC_ACQUIRE)) <= n ||
                         f == FGB_QUIT; i++) {
@@ -739,14 +740,11 @@ static DWORD WINAPI bridge_present_thread(void *arg)
             fg = bsh->fg_frames;
             p12_set_mode(fg);
         }
-        if (now.QuadPart - last_vrr.QuadPart > qpf.QuadPart) {   /* G-Sync on the game's display, for bug reports only */
+        if (n == 0) {   /* G-Sync on the game's display, for bug reports only: once, the NVAPI call stalls this thread ~20 ms
+                           (asked every second it cost a frame each second, AGENT_LOG 156) */
             int v = p12_vrr_flags();
-            if (v != vrr) {
-                vrr = v;
-                fprintf(stderr, "  display: %s (NVAPI VRR flags %d; the helper's frames do not get windowed G-Sync, AGENT_LOG 140)\n",
-                        v < 0 ? "unknown" : v & 16 ? "G-Sync / VRR on" : "fixed refresh", v);
-            }
-            last_vrr = now;
+            fprintf(stderr, "  display: %s (NVAPI VRR flags %d; the helper's frames do not get windowed G-Sync, AGENT_LOG 140)\n",
+                    v < 0 ? "unknown" : v & 16 ? "G-Sync / VRR on" : "fixed refresh", v);
         }
         if (bsh->vsync_off != vsync_off) {   /* the player's V-Sync choice */
             vsync_off = bsh->vsync_off;
@@ -781,12 +779,14 @@ static int bridge_main(int argc, char **argv)
     if (!wa || wn < 5) { fprintf(stderr, "helper64 bridge: command line not readable\n"); return 1; }
     lstrcpynW(sl_dir, wa[3], MAX_PATH);
     lstrcpynW(log_dir, wa[4], MAX_PATH);
+    wchar_t wa_last[16] = L"";
+    if (wn > 5) lstrcpynW(wa_last, wa[5], 16);
     LocalFree(wa);
     if (log_dir[0]) {   /* started without a window (CREATE_NO_WINDOW): stats go to <log dir>\fgbridge_helper.log unless stderr is a file or pipe */
         wchar_t lp[MAX_PATH];
         swprintf(lp, MAX_PATH, L"%ls\\fgbridge_helper.log", log_dir);
         DWORD ft = GetFileType(GetStdHandle(STD_ERROR_HANDLE));
-        if (ft != FILE_TYPE_DISK && ft != FILE_TYPE_PIPE) _wfreopen(lp, L"w", stderr);
+        if (ft != FILE_TYPE_DISK && ft != FILE_TYPE_PIPE) _wfreopen(lp, wn > 5 && !wcscmp(wa_last, L"append") ? L"a" : L"w", stderr);   /* a helper after another one (F11 switch): its log goes on */
         setvbuf(stderr, NULL, _IONBF, 0);
     }
     HANDLE map = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, names[0]);
@@ -801,16 +801,25 @@ static int bridge_main(int argc, char **argv)
     const wchar_t *objs[9];
     for (int i = 0; i < 9; i++) objs[i] = names[2 + i];
     p12_set_fg_test_limit(sh->fg_test_limit);
+    p12_set_tech(sh->tech);
     if (!p12_bridge_init(sh->luid_lo, sh->luid_hi, (HWND)(uintptr_t)sh->hwnd, sh->width, sh->height, objs, sl_dir,
                          log_dir[0] ? log_dir : NULL)) { sh->error = 1; return 3; }
     sh->fg_max = p12_fg_max();   /* the game reads it once helper_ok is set */
+    b_n0 = b_started = sh->done;   /* a helper started after another one goes on from its last frame */
+    if (b_n0) fprintf(stderr, "  started after another helper: from frame %u\n", b_n0);
+    int dv = p12_driver_vsync();
+    sh->driver_vsync = (uint32_t)(dv + 1);
+    fprintf(stderr, "  NVIDIA driver Vertical sync: %s\n", dv == 0 ? "the application decides" : dv == 1 ? "forced on" : dv == 2 ? "forced off"
+                                                         : dv == 3 ? "Fast Sync" : "unknown");
     HANDLE pt = CreateThread(NULL, 0, bridge_present_thread, NULL, 0, NULL);
     if (!pt) { sh->error = 1; return 3; }
-    sh->helper_caps = FGB_CAP_PRESET | FGB_CAP_HUD_POST | FGB_CAP_VSYNC;
+    sh->helper_caps = FGB_CAP_PRESET | FGB_CAP_HUD_POST | FGB_CAP_VSYNC | FGB_CAP_RESTART;
+    p12_backends((uint32_t *)&sh->sr_backend, (uint32_t *)&sh->fg_backend);
+    sh->helper_caps |= FGB_CAP_FSR;
     __atomic_store_n(&sh->helper_ok, 1, __ATOMIC_RELEASE);
     uint32_t sr_cfg[4] = { 0, 0, 0, 0 }, sr_prev = 0, scene_prev = 0, b_cuts = 0, b_stalls = 0, cam_logged = 0;
     LARGE_INTEGER b_frame_t = { 0 };
-    for (uint32_t n = 0;; n++) {
+    for (uint32_t n = b_n0;; n++) {
         uint32_t f, s = 0;
         /* frame n starts with its SR inputs (mid-frame) or its final image (Present), whichever comes first */
         for (int i = 0;; i++) {

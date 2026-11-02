@@ -19,7 +19,12 @@
 #include <sl_reflex.h>
 #include <sl_pcl.h>
 #include "present12.h"
-enum { sl_on = 1 };
+#include "ffx12.h"
+// FSR build (FSR_PLAN F2 / F3): FGB_FSR=1 in the environment runs AMD FSR upscaling + frame generation instead of
+// Streamline (Streamline is then never loaded); the dev test on NVIDIA GPUs. Mixed mode (F4): on an RTX GPU without
+// DLSS-G (RTX 20 / 30, or the test limit fglimit=1) DLSS upscaling stays and frame generation is AMD FSR's
+static bool sl_on = true;
+static bool ffx_fg;   // frame generation and Present through AMD's swapchain (FSR mode or mixed mode)
 
 using namespace sl;
 
@@ -110,7 +115,8 @@ extern "C" uint32_t p12_fg_max(void) { return fg_max; }
 static FrameToken *token;
 static FrameToken *tokens[4];   // frame n uses tokens[n % 4]
 // bridge (frame bridge with the game, AGENT_LOG 95/96)
-static ID3D12Resource *br[6];   // final, HUD-less, depth, motion vectors, SR output x 2 (frame n uses 4 + n % 2)
+static ID3D12Resource *br[6];
+static ID3D12Resource *br_react;   // AMD FSR's reactive mask from the game (FSR build of the engine fix), else null
 static ID3D12Fence *f_game, *f_sr, *f_done;   // game: 2n+1 inputs, 2n+2 final; SR queue: n+1; present queue: n+1
 static ID3D12CommandQueue *queue_sr;          // the mid-frame DLSS SR pass, so it never waits behind a Present
 static ID3D12GraphicsCommandList *cl_sr;
@@ -184,9 +190,90 @@ static void begin_frame(uint32_t n)
     slPCLSetMarker(PCLMarker::eRenderSubmitStart, *token);
 }
 
+static ID3D12Resource *hud_copy[2];   // the HUD-less image of frame n in [n % 2]: AMD's swapchain reads it after Present
+static uint32_t frame_limit_us;       // the frame cap as Reflex counts it (microseconds per shown frame)
+static float view_vp[16], fsr_jsign = 1;
+static bool no_hud;   // dev test FGB_FSR_NOHUD (uicap's control): the final image given as the HUD-less one
+static LARGE_INTEGER fsr_last;
+static struct { float jx, jy, dt; CamVp cam; bool reset; } fr_info[8];   // frame n's values in [n % 8], set by the SR thread
+static CamVp cam_ok = { 0.1f, 1000, 1, { 0, 0, 0 }, { 1, 0, 0 }, { 0, 1, 0 }, { 0, 0, 1 } };   // last valid camera
+extern "C" void p12_set_view(const float vp[16]) { memcpy(view_vp, vp, sizeof view_vp); }
+static uint32_t p_tech;   // the game's FgbShared::tech: 0 NVIDIA only (older game side), 1 auto, 2 AMD FSR for both, 3 DLSS + FSR frame generation
+extern "C" void p12_set_tech(uint32_t tech) { p_tech = tech; }
+extern "C" void p12_backends(uint32_t *sr, uint32_t *fg) { *sr = sl_on ? 1 : 2; *fg = !fg_max ? 0 : ffx_fg ? 2 : 1; }
+static int verify_signed(const wchar_t *p) { return signed_by_nvidia(p); }   // a valid Authenticode signature (any signer)
+
+// AMD's DLLs from the helper's folder (signature checked) and the dev test switches
+static int load_ffx(void)
+{
+    wchar_t dir[MAX_PATH];
+    GetModuleFileNameW(nullptr, dir, MAX_PATH);
+    *wcsrchr(dir, L'\\') = 0;
+    if (!ffx_load(dir, verify_signed)) return 0;
+    const char *js = getenv("FGB_FSR_JSIGN");   // dev test: the jitter sign (FSR_PLAN 2.2)
+    if (js) fsr_jsign = (float)atof(js);
+    no_hud = getenv("FGB_FSR_NOHUD") != nullptr;
+    return 1;
+}
+
+// AMD FSR for both upscaling and frame generation: the device from Windows' own D3D12, no NVIDIA file loaded
+static int init_fsr(const LUID *luid, uint32_t w, uint32_t h)
+{
+    sl_on = false;
+    if (!(ffx_fg = load_ffx())) return 0;
+    IDXGIFactory4 *fac;
+    IDXGIAdapter1 *ad;
+    if (FAILED(CreateDXGIFactory2(0, __uuidof(IDXGIFactory4), (void **)&fac)) ||
+        FAILED(fac->EnumAdapterByLuid(*luid, __uuidof(IDXGIAdapter1), (void **)&ad))) { fprintf(stderr, "p12: no adapter for the game's LUID\n"); return 0; }
+    HRESULT hr = D3D12CreateDevice(ad, D3D_FEATURE_LEVEL_12_0, __uuidof(ID3D12Device), (void **)&d12);
+    ad->Release(); fac->Release();
+    if (FAILED(hr)) { fprintf(stderr, "p12: D3D12CreateDevice 0x%08lx\n", hr); return 0; }
+    D3D12_COMMAND_QUEUE_DESC qd = { D3D12_COMMAND_LIST_TYPE_DIRECT, 0, D3D12_COMMAND_QUEUE_FLAG_NONE, 0 };
+    d12->CreateCommandQueue(&qd, __uuidof(ID3D12CommandQueue), (void **)&queue);
+    for (auto &a : alloc) d12->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, __uuidof(ID3D12CommandAllocator), (void **)&a);
+    for (auto &a : sr_alloc) d12->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, __uuidof(ID3D12CommandAllocator), (void **)&a);
+    d12->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc[0], nullptr, __uuidof(ID3D12GraphicsCommandList), (void **)&cl);
+    cl->Close();
+    width = w; height = h;
+    if (!ffx_sr_create(d12, w, h)) return 0;
+    fg_ok = true; fg_max = 1;   // AMD FSR frame generation: one generated frame per rendered frame (2x)
+    fprintf(stderr, "  p12: AMD FSR mode (jitter sign %+.0f), frame generation allowed: 2x\n", fsr_jsign);
+    return 1;
+}
+
+// after the game's textures are open: AMD's swapchain on the game window (its HUD-less format is known now)
+static void queue_idle(ID3D12CommandQueue *q);
+static int init_fsr_fg(HWND hwnd)
+{
+    IDXGIFactory2 *fac;
+    if (FAILED(CreateDXGIFactory2(0, __uuidof(IDXGIFactory2), (void **)&fac))) return 0;
+    D3D12_RESOURCE_DESC hd = br[1]->GetDesc();
+    if (getenv("FGB_SWAP_PROBE")) {   /* dev test (AGENT_LOG 166): can any swapchain be made on this window now? */
+        DXGI_SWAP_CHAIN_DESC1 pd = { width, height, DXGI_FORMAT_R8G8B8A8_UNORM, FALSE, { 1, 0 }, DXGI_USAGE_RENDER_TARGET_OUTPUT, 2,
+                                     DXGI_SCALING_STRETCH, DXGI_SWAP_EFFECT_FLIP_DISCARD, DXGI_ALPHA_MODE_UNSPECIFIED, 0 };
+        IDXGISwapChain1 *ps = nullptr;
+        HRESULT ph = fac->CreateSwapChainForHwnd(queue, hwnd, &pd, nullptr, nullptr, &ps);
+        fprintf(stderr, "  p12: probe: a plain flip swapchain on the game window: 0x%08lx\n", ph);
+        if (ps) { ps->Release(); queue_idle(queue); }
+    }
+    IDXGISwapChain4 *s4 = ffx_fg_create(d12, queue, fac, hwnd, width, height, DXGI_FORMAT_R8G8B8A8_UNORM, hd.Format, 2);
+    if (s4) fac->MakeWindowAssociation(hwnd, DXGI_MWA_NO_WINDOW_CHANGES | DXGI_MWA_NO_ALT_ENTER);
+    fac->Release();
+    if (!s4) return 0;
+    sc = s4;
+    p_hwnd = hwnd;
+    for (uint32_t i = 0; i < 2; i++) sc->GetBuffer(i, __uuidof(ID3D12Resource), (void **)&bufs[i]);
+    hd.Flags = D3D12_RESOURCE_FLAG_NONE;
+    D3D12_HEAP_PROPERTIES hp = { D3D12_HEAP_TYPE_DEFAULT };
+    for (auto &r : hud_copy)
+        if (FAILED(d12->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &hd, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                                __uuidof(ID3D12Resource), (void **)&r))) return 0;
+    return 1;
+}
 
 static int init_core(const LUID *luid, HWND hwnd, uint32_t w, uint32_t h, const wchar_t *sl_dir, const wchar_t *log_dir)
 {
+    if (p_tech == 2 || getenv("FGB_FSR")) return init_fsr(luid, w, h);
     {   // NVIDIA only: the adapter the inputs come from, checked with Windows' own DXGI before any NVIDIA file is loaded
         IDXGIFactory4 *f = nullptr;
         IDXGIAdapter1 *a = nullptr;
@@ -196,6 +283,10 @@ static int init_core(const LUID *luid, HWND hwnd, uint32_t w, uint32_t h, const 
         if (a) a->Release();
         if (f) f->Release();
         if (!known || ad.VendorId != 0x10DE) {
+            if (known && p_tech) {   // AMD, Intel: no NVIDIA file is loaded
+                fprintf(stderr, "  p12: the game's GPU is not NVIDIA (vendor 0x%04X) - AMD FSR for upscaling and frame generation\n", ad.VendorId);
+                return init_fsr(luid, w, h);
+            }
             fprintf(stderr, "p12: the game's GPU is %s (vendor 0x%04X) - DLSS needs an NVIDIA RTX GPU, helper not started\n",
                     known ? "not NVIDIA" : "unknown", ad.VendorId);
             return 0;
@@ -243,8 +334,21 @@ static int init_core(const LUID *luid, HWND hwnd, uint32_t w, uint32_t h, const 
     Result sup = p_slIsFeatureSupported(kFeatureDLSS_G, ai), sup_sr = p_slIsFeatureSupported(kFeatureDLSS, ai);
     fprintf(stderr, "  p12: DLSS SR supported: %s (%d), DLSS-G supported: %s (%d)\n", sup_sr == Result::eOk ? "yes" : "NO", (int)sup_sr,
             sup == Result::eOk ? "yes" : "NO", (int)sup);
-    if (sup_sr != Result::eOk && sup != Result::eOk) return 0;   // neither (not an RTX GPU): nothing for the helper to do
+    if (sup_sr != Result::eOk && sup != Result::eOk) {   // neither (not an RTX GPU): nothing for the helper to do
+        if (p_tech) {   // GTX 10 / 16: AMD FSR for both, Streamline closed again
+            ad12->Release(); fac->Release();
+            p_slShutdown();
+            fprintf(stderr, "  p12: no DLSS on this NVIDIA GPU - AMD FSR for upscaling and frame generation\n");
+            return init_fsr(luid, w, h);
+        }
+        return 0;
+    }
     fg_ok = sup == Result::eOk && fg_test_limit != 1;
+    if (p_tech == 3) fg_ok = false;   // the player picked AMD FSR frame generation (mixed mode below)
+    // mixed mode: no DLSS-G here, so AMD FSR frame generation on AMD's own swapchain (Windows' DXGI, not Streamline's);
+    // DLSS upscaling as always. Only for a game side that knows FSR (tech != 0): an older one would show it as DLSS.
+    // FGB_FSR_NOFG=1: no frame generation, as the release helper on RTX 20 / 30
+    if (p_tech && !fg_ok && sup_sr == Result::eOk && !getenv("FGB_FSR_NOFG")) ffx_fg = load_ffx();
 
     HRESULT hr = slD3D12CreateDevice(ad12, D3D_FEATURE_LEVEL_12_0, __uuidof(ID3D12Device), (void **)&d12);
     if (FAILED(hr)) { fprintf(stderr, "p12: D3D12CreateDevice 0x%08lx\n", hr); return 0; }
@@ -255,6 +359,13 @@ static int init_core(const LUID *luid, HWND hwnd, uint32_t w, uint32_t h, const 
     for (auto &a : sr_alloc) d12->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, __uuidof(ID3D12CommandAllocator), (void **)&a);
     d12->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc[0], nullptr, __uuidof(ID3D12GraphicsCommandList), (void **)&cl);
     cl->Close();
+    if (ffx_fg) {   // AMD's swapchain comes in init_fsr_fg, once the game's textures are open
+        fac->Release(); ad12->Release();
+        width = w; height = h; fg_max = 1;
+        fprintf(stderr, "  p12: DLSS upscaling with AMD FSR frame generation (no DLSS-G on this GPU%s), frame generation allowed: 2x\n",
+                fg_test_limit == 1 ? ": test limit" : "");
+        return 1;
+    }
 
     DXGI_SWAP_CHAIN_DESC1 d = { w, h, DXGI_FORMAT_R8G8B8A8_UNORM, FALSE, { 1, 0 }, DXGI_USAGE_RENDER_TARGET_OUTPUT, 3,
                                 DXGI_SCALING_STRETCH, DXGI_SWAP_EFFECT_FLIP_DISCARD, DXGI_ALPHA_MODE_UNSPECIFIED, 0 };
@@ -343,12 +454,26 @@ extern "C" int p12_bridge_init(uint32_t luid_lo, int32_t luid_hi, HWND hwnd, uin
         }
         CloseHandle(hh);
     }
+    {   // optional: "react" beside the others (names[3] ends in "final"); FGB_FSR_NOREACT: not used (A/B)
+        wchar_t rn[64];
+        lstrcpynW(rn, names[3], 64);
+        wchar_t *s = wcsstr(rn, L"_final");
+        if (s && !getenv("FGB_FSR_NOREACT")) {
+            lstrcpyW(s, L"_react");
+            if (SUCCEEDED(d12->OpenSharedHandleByName(rn, GENERIC_ALL, &hh))) {
+                if (FAILED(d12->OpenSharedHandle(hh, __uuidof(ID3D12Resource), (void **)&br_react))) br_react = nullptr;
+                CloseHandle(hh);
+            }
+        }
+        fprintf(stderr, "  p12: AMD FSR reactive mask: %s\n", br_react ? "from the game" : "none");
+    }
     D3D12_COMMAND_QUEUE_DESC qd = { D3D12_COMMAND_LIST_TYPE_DIRECT, 0, D3D12_COMMAND_QUEUE_FLAG_NONE, 0 };
     if (FAILED(d12->CreateCommandQueue(&qd, __uuidof(ID3D12CommandQueue), (void **)&queue_sr)) ||
         FAILED(d12->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, sr_alloc[0], nullptr, __uuidof(ID3D12GraphicsCommandList),
                                       (void **)&cl_sr))) { fprintf(stderr, "p12: SR queue\n"); return 0; }
     cl_sr->Close();
     sr_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (ffx_fg && !init_fsr_fg(hwnd)) return 0;
     init_tail();
     return 1;
 }
@@ -357,20 +482,25 @@ extern "C" int p12_bridge_init(uint32_t luid_lo, int32_t luid_hi, HWND hwnd, uin
 // G-Sync / VRR on the game window's display, from NVIDIA's driver: NvAPI_Disp_GetVRRInfo's flags (bit 0 VRR enabled, 1
 // possible, 2 requested, 3 indicator, 4 display in VRR mode), or -1 when unknown. Function IDs and NV_GET_VRR_INFO_V1's
 // layout from Rome 2's port (the NVAPI headers, MIT licence); nvapi64.dll is the driver's own.
-extern "C" int p12_vrr_flags(void)
+static void *(*nvapi_qi(void))(uint32_t)   // nvapi_QueryInterface once NvAPI_Initialize worked, else null
 {
-    static int (*by_name)(const char *, uint32_t *), (*vrr_info)(uint32_t, void *);
+    static void *(*qi)(uint32_t);
     static bool tried;
     if (!tried) {
         tried = true;
         HMODULE m = LoadLibraryW(L"nvapi64.dll");
-        auto qi = m ? (void *(*)(uint32_t))(void *)GetProcAddress(m, "nvapi_QueryInterface") : nullptr;
-        auto init = qi ? (int (*)(void))qi(0x0150e828) : nullptr;   // NvAPI_Initialize
-        if (init && init() == 0) {
-            by_name = (int (*)(const char *, uint32_t *))qi(0xae457190);   // NvAPI_DISP_GetDisplayIdByDisplayName
-            vrr_info = (int (*)(uint32_t, void *))qi(0xdf8fda57);        // NvAPI_Disp_GetVRRInfo
-        }
+        auto q = m ? (void *(*)(uint32_t))(void *)GetProcAddress(m, "nvapi_QueryInterface") : nullptr;
+        auto init = q ? (int (*)(void))q(0x0150e828) : nullptr;   // NvAPI_Initialize
+        if (init && init() == 0) qi = q;
     }
+    return qi;
+}
+
+extern "C" int p12_vrr_flags(void)
+{
+    auto qi = nvapi_qi();
+    auto by_name = qi ? (int (*)(const char *, uint32_t *))qi(0xae457190) : nullptr;   // NvAPI_DISP_GetDisplayIdByDisplayName
+    auto vrr_info = qi ? (int (*)(uint32_t, void *))qi(0xdf8fda57) : nullptr;          // NvAPI_Disp_GetVRRInfo
     MONITORINFOEXA mi{};
     mi.cbSize = sizeof mi;
     HMONITOR mon = p_hwnd ? MonitorFromWindow(p_hwnd, MONITOR_DEFAULTTONEAREST) : nullptr;
@@ -381,8 +511,45 @@ extern "C" int p12_vrr_flags(void)
     return vrr_info(id, &v) == 0 ? (int)(v.flags & 31) : -1;
 }
 
+// The driver's Vertical sync for this process (NVIDIA Control Panel / app: helper64.exe's own profile if one names it,
+// else the global one): it overrides the Present interval, so a forced On costs the V-Sync fps whatever the player picks
+// in F11 (AGENT_LOG 157). 0 the application decides, 1 forced on (or every 2nd-4th refresh), 2 forced off, 3 Fast Sync,
+// -1 unknown. IDs, values and layouts from Streamline's NVAPI headers (NvApiDriverSettings.h, nvapi.h: NVDRS_SETTING_V1
+// 12320 bytes, current value at 8220, NVDRS_APPLICATION_V4 20492 bytes, pack 4).
+extern "C" int p12_driver_vsync(void)
+{
+    auto qi = nvapi_qi();
+    if (!qi) return -1;
+    auto create = (int (*)(void **))qi(0x0694d52e);
+    auto load = (int (*)(void *))qi(0x375dbd6b), destroy = (int (*)(void *))qi(0xdad9cff8);
+    auto global = (int (*)(void *, void **))qi(0x617bff9f);
+    auto find = (int (*)(void *, const uint16_t *, void **, void *))qi(0xeee566b2);
+    auto get = (int (*)(void *, void *, uint32_t, void *))qi(0x73bf8338);
+    void *s = nullptr, *prof = nullptr;
+    if (!create || !load || !destroy || !global || !find || !get || create(&s) != 0) return -1;
+    static uint8_t app[20492], set[12320];
+    static uint16_t name[2048];   // NvAPI_UnicodeString: the driver may read all 2048
+    wchar_t path[MAX_PATH];
+    DWORD n = GetModuleFileNameW(nullptr, path, MAX_PATH);
+    const wchar_t *base = wcsrchr(path, L'\\') ? wcsrchr(path, L'\\') + 1 : path;
+    for (int i = 0; n && base[i] && i < 2047; i++) name[i] = base[i];
+    *(uint32_t *)app = sizeof app | 4u << 16;   // NVDRS_APPLICATION_VER_V4
+    *(uint32_t *)set = sizeof set | 1u << 16;   // NVDRS_SETTING_VER1
+    int r = load(s) != 0 ? -1 : find(s, name, &prof, app) == 0 || global(s, &prof) == 0 ? get(s, prof, 0x00A879CF, set) : -1;
+    destroy(s);
+    uint32_t v = r == 0 ? *(uint32_t *)(set + 8220) : r == -160 ? 0x60925292u : 0;   // -160 NVAPI_SETTING_NOT_FOUND: default
+    switch (v) {
+    case 0x60925292: return 0;   // VSYNCMODE_PASSIVE (the application decides, the default)
+    case 0x47814940: case 0x32610244: case 0x71271021: case 0x13245256: return 1;   // FORCEON, FLIPINTERVAL2..4
+    case 0x08416747: return 2;   // FORCEOFF
+    case 0x18888888: return 3;   // VIRTUAL (Fast Sync)
+    default: return -1;
+    }
+}
+
 extern "C" void p12_set_frame_limit(uint32_t us)
 {
+    if (ffx_fg) { frame_limit_us = us; return; }   // our own limiter in present_fsr
     ReflexOptions ro{};
     ro.mode = ReflexMode::eLowLatency;
     ro.frameLimitUs = us;
@@ -393,7 +560,7 @@ extern "C" void p12_set_mode(uint32_t frames_to_generate)
 {
     if (frames_to_generate > fg_max) frames_to_generate = fg_max;   // never more than the GPU allows
     fg_frames = frames_to_generate;
-    if (!fg_ok || !sl_on) return;   // no frame generation on this GPU: DLSS-G stays off (its default); FSR reads fg_frames
+    if (!fg_ok || ffx_fg) return;   // no frame generation on this GPU: DLSS-G stays off (its default); FSR reads fg_frames
     DLSSGOptions o{};
     o.mode = frames_to_generate ? DLSSGMode::eOn : DLSSGMode::eOff;
     o.numFramesToGenerate = frames_to_generate ? frames_to_generate : 1;
@@ -566,6 +733,19 @@ extern "C" int p12_bridge_frame(uint32_t n, int reset, int sr)
         slPCLSetMarker(PCLMarker::eRenderSubmitStart, *tk);
         set_constants(*tk, reset);
     }
+    if (ffx_fg) {   // frame n's camera, jitter and frame time, for its upscaling here and its frame generation on the present thread
+        auto &fi = fr_info[n % 8];
+        CamVp c;
+        if (cam_from_vp(view_vp, &c)) cam_ok = c;
+        fi.cam = cam_ok;
+        fi.jx = sr ? fsr_jsign * jit_x : 0; fi.jy = sr ? fsr_jsign * jit_y : 0;
+        LARGE_INTEGER now, qf;
+        QueryPerformanceCounter(&now); QueryPerformanceFrequency(&qf);
+        fi.dt = fsr_last.QuadPart ? (float)((now.QuadPart - fsr_last.QuadPart) * 1000.0 / qf.QuadPart) : 16.7f;
+        if (fi.dt > 100) fi.dt = 100;
+        fsr_last = now;
+        fi.reset = reset != 0;   // camera cut / stall (helper64.c): frame generation must not blend across it either
+    }
     if (!sr) return 1;
     uint32_t slot = n % 3;
     wait_value(f_sr, sr_slot_done[slot], sr_event);
@@ -583,6 +763,7 @@ extern "C" int p12_bridge_frame(uint32_t n, int reset, int sr)
         c->ResourceBarrier(1, &rb);
     };
     for (int i = 1; i < 4; i++) bar(br[i], D3D12_RESOURCE_STATE_COMMON, rd);
+    if (!sl_on && br_react) bar(br_react, D3D12_RESOURCE_STATE_COMMON, rd);
     bar(out, D3D12_RESOURCE_STATE_COMMON, ua);
     Resource rin(ResourceType::eTex2d, br[1], nullptr, nullptr, (uint32_t)rd);
     Resource rdp(ResourceType::eTex2d, br[2], nullptr, nullptr, (uint32_t)rd);
@@ -598,11 +779,16 @@ extern "C" int p12_bridge_frame(uint32_t n, int reset, int sr)
     if (sl_on && p_slSetTagForFrame(*tk, viewport, tags, 4, (CommandBuffer *)c) != Result::eOk) st_tag_fail++;
     c->EndQuery(ts_heap, D3D12_QUERY_TYPE_TIMESTAMP, slot * 2);
     const BaseStructure *inputs[] = { &viewport };
+    if (!sl_on) {
+        const auto &fi = fr_info[n % 8];
+        if (!ffx_sr_dispatch(c, br[1], br[2], br[3], br_react, out, rw, rh, fi.jx, fi.jy, reset, &fi.cam, fi.dt)) st_tag_fail++;
+    } else
     if (p_slEvaluateFeature(kFeatureDLSS, *tk, inputs, 1, (CommandBuffer *)c) != Result::eOk) st_tag_fail++;
     c->EndQuery(ts_heap, D3D12_QUERY_TYPE_TIMESTAMP, slot * 2 + 1);
     c->ResolveQueryData(ts_heap, D3D12_QUERY_TYPE_TIMESTAMP, slot * 2, 2, ts_buf, slot * 16);
     ts_pending[slot] = true;
     for (int i = 1; i < 4; i++) bar(br[i], rd, D3D12_RESOURCE_STATE_COMMON);
+    if (!sl_on && br_react) bar(br_react, rd, D3D12_RESOURCE_STATE_COMMON);
     bar(out, ua, D3D12_RESOURCE_STATE_COMMON);
     c->Close();
     queue_sr->Wait(f_game, 2ull * n + 1);
@@ -749,6 +935,81 @@ extern "C" int p12_present(uint32_t n, ID3D11Texture2D *color, ID3D11Texture2D *
     return present_core(n, c12, c12, d12r, m12, reset, 1, fence12, 2ull * n + 1, fence12, 2ull * n + 2, 0);
 }
 
+/* the same frame through AMD FSR frame generation: final colour into AMD's back buffer, the HUD-less image into our copy
+   n % 2 (AMD's swapchain composes after Present returns, the game may overwrite its texture after _fdone n+1), configure +
+   prepare (depth / motion vectors are consumed on this command list), then Present: AMD's swapchain interpolates and paces */
+static int present_fsr(uint32_t n, int reset, int sr_done, int hud_post)
+{
+    ID3D12Resource *c12 = br[0], *hud12 = sr_done && !hud_post ? br[4 + n % 2] : br[1], *d12r = br[2], *m12 = br[3], *hc = hud_copy[n % 2];
+    LARGE_INTEGER q0, q1, qf, t0, t1;
+    QueryPerformanceCounter(&q0); QueryPerformanceFrequency(&qf);
+    queue->Wait(f_game, 2ull * n + 2);
+    uint32_t slot = n % 3;
+    QueryPerformanceCounter(&t0);
+    wait_value(f_done, slot_done[slot], fence_event);
+    QueryPerformanceCounter(&t1);
+    st_slot_t += (t1.QuadPart - t0.QuadPart);
+    alloc[slot]->Reset();
+    cl->Reset(alloc[slot], nullptr);
+    const D3D12_RESOURCE_STATES rd = D3D12_RESOURCE_STATE_GENERIC_READ, cm = D3D12_RESOURCE_STATE_COMMON;
+    ID3D12Resource *in[4] = { c12, hud12, d12r, m12 };
+    for (auto r : in) barrier(r, cm, rd);
+    ID3D12Resource *bb = bufs[sc->GetCurrentBackBufferIndex()];
+    barrier(bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST);
+    D3D12_TEXTURE_COPY_LOCATION dst = {}, src = {};
+    dst.pResource = bb; dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    src.pResource = c12; src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    D3D12_BOX box = { 0, 0, 0, width, height, 1 };
+    cl->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
+    barrier(bb, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT);
+    barrier(hc, rd, D3D12_RESOURCE_STATE_COPY_DEST);
+    cl->CopyResource(hc, no_hud ? c12 : hud12);
+    barrier(hc, D3D12_RESOURCE_STATE_COPY_DEST, rd);
+    const auto &fi = fr_info[n % 8];
+    bool on = fg_frames > 0;
+    reset |= fi.reset;
+    if (!ffx_fg_frame(cl, n, on, hc, d12r, m12, br_iw, br_ih, fi.jx, fi.jy, reset, &fi.cam, fi.dt)) st_tag_fail++;
+    for (auto r : in) barrier(r, rd, cm);
+    cl->Close();
+    queue->ExecuteCommandLists(1, (ID3D12CommandList **)&cl);
+    queue->Signal(f_done, n + 1);
+    slot_done[slot] = n + 1;
+
+    if (frame_limit_us) {   // the frame cap on presents (a present shows 2 frames with frame generation on)
+        static LARGE_INTEGER next;
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+        int64_t iv = (int64_t)frame_limit_us * (on ? 2 : 1) * qf.QuadPart / 1000000;
+        // Sleep() wakes on the 15.6 ms system tick: a 120 cap gave 92 fps with frame generation off. A high-resolution
+        // timer (Windows 10 1803+) wakes ~1 ms early, the spin does the rest; Sleep only if it cannot be created
+        static HANDLE cap_timer;   // set here, not in the declaration: a guarded static would need libc++.dll
+        if (!cap_timer) cap_timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+        int64_t left_ms = (next.QuadPart - now.QuadPart) * 1000 / qf.QuadPart - 1;
+        if (left_ms > 0 && cap_timer) {
+            LARGE_INTEGER due = { .QuadPart = -left_ms * 10000 };
+            if (SetWaitableTimer(cap_timer, &due, 0, nullptr, nullptr, FALSE)) WaitForSingleObject(cap_timer, INFINITE);
+        } else if (left_ms > 1) Sleep((DWORD)left_ms);
+        do QueryPerformanceCounter(&now); while (now.QuadPart < next.QuadPart);
+        next.QuadPart = (next.QuadPart + iv > now.QuadPart ? next.QuadPart : now.QuadPart) + iv;
+    }
+    // the player's V-Sync, as on the DLSS path: AMD's swapchain presents with the interval given here (with 0 and frame
+    // generation on it adds DXGI_PRESENT_ALLOW_TEARING itself and tore: 473 display changes/s on 240 Hz, PresentMon); off
+    // asks for tearing with frame generation off too. No guard: AMD's swapchain paces the frames itself
+    UINT sync = vs_user_off ? 0 : 1;
+    (sync ? st_vsync_on : st_vsync_off)++;
+    QueryPerformanceCounter(&t0);
+    HRESULT hr = sc->Present(sync, sync ? 0 : DXGI_PRESENT_ALLOW_TEARING);
+    QueryPerformanceCounter(&t1);
+    st_present_t += (t1.QuadPart - t0.QuadPart);
+    if (FAILED(hr)) st_present_fail++;
+    st_presents++;
+    uint32_t shown = on && !reset ? 2 : 1;   // estimate: AMD's swapchain shows the generated frame before each real one
+    st_frames_shown += shown; st_shown_total += shown; st_shown_hist[shown]++;
+    QueryPerformanceCounter(&q1);
+    st_cpu_ms += (q1.QuadPart - q0.QuadPart) * 1000.0 / qf.QuadPart;
+    st_tick_ms = 1000.0 / qf.QuadPart;
+    return 1;
+}
 
 /* bridge, present thread: frame generation. With SR on this frame the HUD-less image is SR output n % 2. Waits game
    fence 2n+2 (final colour), signals present fence n+1 once frame n's inputs are read. */
@@ -757,6 +1018,7 @@ extern "C" int p12_bridge_present(uint32_t n, int reset, int sr_done, uint32_t i
     br_iw = in_w; br_ih = in_h;
     /* hud_post: the game wrote its own HUD-less image after SR into _hudless (full size: SR output + ReShade's effects) */
     if (sr_done && hud_post) st_hud_post++;
+    if (ffx_fg) return present_fsr(n, reset, sr_done, hud_post);
     return present_core(n, br[0], sr_done && !hud_post ? br[4 + n % 2] : br[1], br[2], br[3], reset, 0, f_game, 2ull * n + 2, f_done, n + 1, sr_done);
 }
 
@@ -780,12 +1042,28 @@ extern "C" void p12_stats(char *buf, size_t len, int reset)
     }
 }
 
+static void queue_idle(ID3D12CommandQueue *q)   // everything submitted to q finished (2 s at most)
+{
+    ID3D12Fence *f = nullptr;
+    HANDLE e = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (q && e && SUCCEEDED(d12->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), (void **)&f)) && SUCCEEDED(q->Signal(f, 1)) &&
+        SUCCEEDED(f->SetEventOnCompletion(1, e)))
+        WaitForSingleObject(e, 2000);
+    if (f) f->Release();
+    if (e) CloseHandle(e);
+}
+
+// An orderly end: frame generation off, both queues idle, the back buffers and the swapchain released before the process
+// ends. Left to the process exit, Windows kept the game window tied to the old swapchain for seconds, and the next helper's
+// swapchain on it was refused ("Access is denied" / AMD's "swapchain failed (3)", F11 switch, AGENT_LOG 166).
 extern "C" void p12_shutdown(void)
 {
     if (!queue) return;
-    p12_set_mode(0);
-    queue->Signal(fence12, UINT64_MAX - 1);
-    fence12->SetEventOnCompletion(UINT64_MAX - 1, fence_event);
-    WaitForSingleObject(fence_event, 2000);
-    p_slShutdown();
+    if (sl_on) p12_set_mode(0);
+    queue_idle(queue);
+    queue_idle(queue_sr);
+    for (auto &b : bufs) if (b) { b->Release(); b = nullptr; }
+    if (ffx_fg) { ffx_shutdown(); sc = nullptr; }   // AMD's swapchain: AMD's code releases it
+    if (sc) { sc->Release(); sc = nullptr; }
+    if (sl_on) p_slShutdown();
 }

@@ -1,12 +1,12 @@
 # Upscaling and Framegen for Total War
 
 NVIDIA DLSS upscaling (DLAA to Ultra Performance) and DLSS frame generation (2x to 4x) for older Total War games on
-GeForce RTX cards. This repository holds the source of the 64-bit helper the mods share. AMD FSR upscaling and frame
-generation are being worked on.
+GeForce RTX cards, and AMD FSR upscaling and frame generation (2x) on every other card (Attila add-on version 8 on).
+This repository holds the source of the 64-bit helper the mods share.
 
 | Game | Mod | Needs |
 |---|---|---|
-| Total War: ATTILA | Upscaling and Framegen for Attila: [Steam Workshop](https://steamcommunity.com/sharedfiles/filedetails/?id=3828791891) | [Attila Engine Performance Fix](https://github.com/JSa25/AttilaCPUPerfFix) 6.3 or newer |
+| Total War: ATTILA | Upscaling and Framegen for Attila: [Steam Workshop](https://steamcommunity.com/sharedfiles/filedetails/?id=3828791891) | [Attila Engine Performance Fix](https://github.com/JSa25/AttilaCPUPerfFix) 6.3 or newer (6.10.0 for AMD FSR) |
 
 Each game's in-game part (the code that hands every frame to this helper, the F11 settings panel, the motion vectors
 for units) is part of that game's engine fix and is in its repository; for Attila: `fgbridge.c`, `bridgeprobe.c`,
@@ -26,7 +26,8 @@ including the generated ones, in the game's window.
 | File | What it does |
 |---|---|
 | `helper64.c` | The helper process: opens the game's shared memory, textures and fences by name, runs the upscaling thread and the frame generation / present thread |
-| `present12.cpp`, `present12.h` | Streamline on Direct3D 12: initialisation (after checking NVIDIA's signature on `sl.interposer.dll`), DLSS Super Resolution, frame generation, the swapchain in the game's window, NVIDIA's rules for what each GPU may do (frame generation only on RTX 40 / 50, up to 4x only where Streamline reports it), NVIDIA GPUs only |
+| `present12.cpp`, `present12.h` | Streamline on Direct3D 12 (and the choice between NVIDIA and AMD FSR per GPU and per the player's pick): initialisation (after checking NVIDIA's signature on `sl.interposer.dll`), DLSS Super Resolution, frame generation, the swapchain in the game's window, NVIDIA's rules for what each GPU may do (frame generation only on RTX 40 / 50, up to 4x only where Streamline reports it), NVIDIA GPUs only |
+| `ffx12.cpp`, `ffx12.h`, `camvp.h` | AMD FSR on Direct3D 12 through the AMD FSR SDK's API: upscaling (with the reactive mask the game shares), frame generation with AMD's swapchain in the game's window, and the camera values FSR needs (from the game's view-projection matrix) |
 | `fgb_proto.h` | The shared block between the game and the helper (the same file is in the engine fix's repository) |
 | `proto.h` | Message layout of an earlier test path that the helper still contains |
 
@@ -36,13 +37,15 @@ You need:
 - [llvm-mingw](https://github.com/mstorsjo/llvm-mingw) (release 20261006, UCRT, x86_64 host), its `bin` folder on `PATH`
 - NVIDIA's [Streamline SDK](https://github.com/NVIDIA-RTX/Streamline) **v2.14.16** (`streamline-sdk-v2.14.16.zip`,
   SHA-256 `32041e51db0cab709a271b72a352281b690c2abbd669a827809401a5dd23956b`), unpacked, and `STREAMLINE` set to its folder
+- AMD's [FSR SDK](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK) **v2.4.0** (tag `v2.4.0`, commit `7539ae8b`),
+  and `FFX` set to its `Kits\FidelityFX` folder (the headers in `api`, `upscalers` and `framegeneration` are used)
 
 Then run `build_helper.bat`. The helper lands in `build\helper64.exe`. The build is reproducible: with the same
 llvm-mingw and SDK versions you get exactly the file in the download (compare
 `certutil -hashfile build\helper64.exe SHA256` with the `SHA256SUMS.txt` in the download).
 
-NVIDIA's files (the Streamline and DLSS DLLs) are not in this repository; they come with the mod downloads, unmodified,
-under NVIDIA's licences.
+NVIDIA's files (the Streamline and DLSS DLLs) and AMD's (the three signed `amd_fidelityfx_*_dx12.dll`) are not in this
+repository; they come with the mod downloads, unmodified, under NVIDIA's licences and the AMD FSR SDK's MIT licence.
 
 ## License
 
