@@ -52,7 +52,7 @@ jobs:
           tr -d '\r' < fsr_sdk_headers.sha256 | while read -r sha path; do
             mkdir -p "$ffx/$(dirname "$path")"
             curl -sSfL "$base/$path" -o "$ffx/$path"
-            got=$(sha256sum "$ffx/$path" | cut -c1-64)
+            got=$(sha256sum < "$ffx/$path" | cut -c1-64)  # stdin: a Windows path would make sha256sum escape its output
             [ "$got" = "$sha" ] || { echo "$path: checksum $got does not match $sha"; exit 1; }
           done
           echo "FFX=$(cygpath -w "$ffx")" >> "$GITHUB_ENV"
