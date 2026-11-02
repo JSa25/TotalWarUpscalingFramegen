@@ -20,6 +20,11 @@
 #include <sl_pcl.h>
 #include "present12.h"
 #include "ffx12.h"
+#ifdef FGB_DEV   // dev builds only: the FGB_* test switches (release helpers carry none of them, AGENT_LOG 187)
+#define dev_getenv(n) getenv(n)
+#else
+#define dev_getenv(n) ((char *)nullptr)
+#endif
 // FSR build (FSR_PLAN F2 / F3): FGB_FSR=1 in the environment runs AMD FSR upscaling + frame generation instead of
 // Streamline (Streamline is then never loaded); the dev test on NVIDIA GPUs. Mixed mode (F4): on an RTX GPU without
 // DLSS-G (RTX 20 / 30, or the test limit fglimit=1) DLSS upscaling stays and frame generation is AMD FSR's
@@ -210,9 +215,9 @@ static int load_ffx(void)
     GetModuleFileNameW(nullptr, dir, MAX_PATH);
     *wcsrchr(dir, L'\\') = 0;
     if (!ffx_load(dir, verify_signed)) return 0;
-    const char *js = getenv("FGB_FSR_JSIGN");   // dev test: the jitter sign (FSR_PLAN 2.2)
+    const char *js = dev_getenv("FGB_FSR_JSIGN");   // dev test: the jitter sign (FSR_PLAN 2.2)
     if (js) fsr_jsign = (float)atof(js);
-    no_hud = getenv("FGB_FSR_NOHUD") != nullptr;
+    no_hud = dev_getenv("FGB_FSR_NOHUD") != nullptr;
     return 1;
 }
 
@@ -248,7 +253,7 @@ static int init_fsr_fg(HWND hwnd)
     IDXGIFactory2 *fac;
     if (FAILED(CreateDXGIFactory2(0, __uuidof(IDXGIFactory2), (void **)&fac))) return 0;
     D3D12_RESOURCE_DESC hd = br[1]->GetDesc();
-    if (getenv("FGB_SWAP_PROBE")) {   /* dev test (AGENT_LOG 166): can any swapchain be made on this window now? */
+    if (dev_getenv("FGB_SWAP_PROBE")) {   /* dev test (AGENT_LOG 166): can any swapchain be made on this window now? */
         DXGI_SWAP_CHAIN_DESC1 pd = { width, height, DXGI_FORMAT_R8G8B8A8_UNORM, FALSE, { 1, 0 }, DXGI_USAGE_RENDER_TARGET_OUTPUT, 2,
                                      DXGI_SCALING_STRETCH, DXGI_SWAP_EFFECT_FLIP_DISCARD, DXGI_ALPHA_MODE_UNSPECIFIED, 0 };
         IDXGISwapChain1 *ps = nullptr;
@@ -273,7 +278,7 @@ static int init_fsr_fg(HWND hwnd)
 
 static int init_core(const LUID *luid, HWND hwnd, uint32_t w, uint32_t h, const wchar_t *sl_dir, const wchar_t *log_dir)
 {
-    if (p_tech == 2 || getenv("FGB_FSR")) return init_fsr(luid, w, h);
+    if (p_tech == 2 || dev_getenv("FGB_FSR")) return init_fsr(luid, w, h);
     {   // NVIDIA only: the adapter the inputs come from, checked with Windows' own DXGI before any NVIDIA file is loaded
         IDXGIFactory4 *f = nullptr;
         IDXGIAdapter1 *a = nullptr;
@@ -348,7 +353,7 @@ static int init_core(const LUID *luid, HWND hwnd, uint32_t w, uint32_t h, const 
     // mixed mode: no DLSS-G here, so AMD FSR frame generation on AMD's own swapchain (Windows' DXGI, not Streamline's);
     // DLSS upscaling as always. Only for a game side that knows FSR (tech != 0): an older one would show it as DLSS.
     // FGB_FSR_NOFG=1: no frame generation, as the release helper on RTX 20 / 30
-    if (p_tech && !fg_ok && sup_sr == Result::eOk && !getenv("FGB_FSR_NOFG")) ffx_fg = load_ffx();
+    if (p_tech && !fg_ok && sup_sr == Result::eOk && !dev_getenv("FGB_FSR_NOFG")) ffx_fg = load_ffx();
 
     HRESULT hr = slD3D12CreateDevice(ad12, D3D_FEATURE_LEVEL_12_0, __uuidof(ID3D12Device), (void **)&d12);
     if (FAILED(hr)) { fprintf(stderr, "p12: D3D12CreateDevice 0x%08lx\n", hr); return 0; }
@@ -458,7 +463,7 @@ extern "C" int p12_bridge_init(uint32_t luid_lo, int32_t luid_hi, HWND hwnd, uin
         wchar_t rn[64];
         lstrcpynW(rn, names[3], 64);
         wchar_t *s = wcsstr(rn, L"_final");
-        if (s && !getenv("FGB_FSR_NOREACT")) {
+        if (s && !dev_getenv("FGB_FSR_NOREACT")) {
             lstrcpyW(s, L"_react");
             if (SUCCEEDED(d12->OpenSharedHandleByName(rn, GENERIC_ALL, &hh))) {
                 if (FAILED(d12->OpenSharedHandle(hh, __uuidof(ID3D12Resource), (void **)&br_react))) br_react = nullptr;

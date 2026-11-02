@@ -14,6 +14,11 @@
 #include <ffx_framegeneration.h>
 #include <dx12/ffx_api_framegeneration_dx12.h>
 #include "ffx12.h"
+#ifdef FGB_DEV   // dev builds only: the FGB_* test switches (release helpers carry none of them, AGENT_LOG 187)
+#define dev_getenv(n) getenv(n)
+#else
+#define dev_getenv(n) ((char *)nullptr)
+#endif
 
 static ffxFunctions fx;
 static ffxContext sr_ctx, fg_ctx, sc_ctx;
@@ -69,13 +74,14 @@ int ffx_sr_create(ID3D12Device *dev, uint32_t w, uint32_t h)
     cd.header.pNext = &ver.header;
     // the game's colour is 8-bit, after tonemapping (gamma-encoded): FSR 4 asks for linear or this flag; exposure automatic
     cd.flags = FFX_UPSCALE_ENABLE_AUTO_EXPOSURE | FFX_UPSCALE_ENABLE_NON_LINEAR_COLORSPACE;
-    if (getenv("FGB_FSR_FLAGS")) cd.flags |= (uint32_t)atoi(getenv("FGB_FSR_FLAGS"));   // dev test: e.g. 4 = MV jitter cancellation
+    if (dev_getenv("FGB_FSR_FLAGS")) cd.flags |= (uint32_t)atoi(dev_getenv("FGB_FSR_FLAGS"));   // dev test: e.g. 4 = MV jitter cancellation
     cd.maxRenderSize = { w, h };
     cd.maxUpscaleSize = { w, h };
     cd.fpMessage = msg;
-    if (getenv("FGB_FSR_MVSIGN")) mvs = (float)atof(getenv("FGB_FSR_MVSIGN"));
+    if (dev_getenv("FGB_FSR_MVSIGN")) mvs = (float)atof(dev_getenv("FGB_FSR_MVSIGN"));
     ffxReturnCode_t r = fx.CreateContext(&sr_ctx, &cd.header, nullptr);
     if (r != FFX_API_RETURN_OK) { fprintf(stderr, "ffx: upscaler context failed (%u)\n", r); sr_ctx = nullptr; return 0; }
+#ifdef FGB_DEV
     // dev test (the moving-object trail, AGENT_LOG 161): AMD's tuning keys, each from an environment variable
     static const struct { const char *env; uint64_t key; } keys[] = { {"FGB_FSR_VELOCITY", FFX_API_CONFIGURE_UPSCALE_KEY_FVELOCITYFACTOR},
         {"FGB_FSR_SHADING", FFX_API_CONFIGURE_UPSCALE_KEY_FSHADINGCHANGESCALE}, {"FGB_FSR_ACCUM", FFX_API_CONFIGURE_UPSCALE_KEY_FACCUMULATIONADDEDPERFRAME},
@@ -89,8 +95,9 @@ int ffx_sr_create(ID3D12Device *dev, uint32_t w, uint32_t h)
         kv.key = k.key; kv.ptr = pv;
         fprintf(stderr, "  ffx: %s %.3f (%s)\n", k.env, *pv, fx.Configure(&sr_ctx, &kv.header) == FFX_API_RETURN_OK ? "set" : "REFUSED");
     }
-    if (getenv("FGB_FSR_METERS")) meters = (float)atof(getenv("FGB_FSR_METERS"));
-    if (getenv("FGB_FSR_RCAS")) rcas = (float)atof(getenv("FGB_FSR_RCAS"));
+#endif
+    if (dev_getenv("FGB_FSR_METERS")) meters = (float)atof(dev_getenv("FGB_FSR_METERS"));
+    if (dev_getenv("FGB_FSR_RCAS")) rcas = (float)atof(dev_getenv("FGB_FSR_RCAS"));
     if (rcas >= 0) fprintf(stderr, "  ffx: FSR sharpening (RCAS) %.2f\n", rcas);
     version_of(&sr_ctx, sr_ver, sizeof sr_ver);
     fprintf(stderr, "  ffx: AMD FSR upscaling ready (%s)\n", sr_ver);
