@@ -3,14 +3,20 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 : "${PROBE_RESULTS:?Set PROBE_RESULTS to a fresh output directory}"
-mkdir -p "$PROBE_RESULTS"
+mkdir "$PROBE_RESULTS"
+PROBE_RESULTS=$(cd "$PROBE_RESULTS" && pwd)
 for colour in rgba bgra; do
   for mode in normal invalid-handle invalid-wire missing-wire partial-import; do
     dest="$PROBE_RESULTS/$colour-$mode"
     mkdir -p "$dest"
     PROBE_LOG_DIR="$dest" bash run.sh "$colour" 3 "$mode" > "$dest/launcher.log" 2>&1
-    # Windows stderr can contain CRLF; preserve raw logs and normalize for checks.
-    cat "$dest/launcher.log" "$dest/steam-325610.log" | tr -d '\r' > "$dest/combined.log"
+    # Only explicit logs from this invocation establish acceptance. Preserve
+    # launcher.log and steam-325610.log independently for Proton diagnostics.
+    shopt -s nullglob
+    producers=("$dest"/process-logs/producer-*.log)
+    consumers=("$dest"/process-logs/consumer-*.log)
+    [[ ${#producers[@]} == 1 && ${#consumers[@]} == 3 ]]
+    cat "${producers[@]}" "${consumers[@]}" | tr -d '\r' > "$dest/combined.log"
     rg -q "PASS probe mode=$mode cycles=3" "$dest/combined.log"
     if [[ $mode == normal ]]; then
       for pair in final:11 hudless:22 depth:33 motion:44 srout0:55 srout1:66 reactive:77; do

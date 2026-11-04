@@ -1,5 +1,6 @@
 // Standalone integration test: no game DLL, FSR, Streamline or production
 // transport.
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -330,11 +331,17 @@ static int producer(const wchar_t *consumer, DXGI_FORMAT colour, int cycles,
     }
     DWORD after = 0;
     WIN(GetProcessHandleCount(GetCurrentProcess(), &after), "producer");
-    fprintf(stderr, "cycle=%d handles before=%lu after=%lu\n", cycle, before,
-            after);
-    // Wine/driver lazily opens process-lifetime handles on the first cycle.
-    if (cycle > 0 && after > before)
-      fail("producer", "handle count grew", after - before);
+    if (!before || !after) {
+      // Some Proton versions return success with zero for this stubbed query.
+      fprintf(stderr, "cycle=%d handle-count unavailable before=%lu after=%lu\n",
+              cycle, before, after);
+    } else {
+      fprintf(stderr, "cycle=%d handles before=%lu after=%lu\n", cycle, before,
+              after);
+      // Wine/driver lazily opens process-lifetime handles on the first cycle.
+      if (cycle > 0 && after > before)
+        fail("producer", "handle count grew", after - before);
+    }
   }
   fprintf(stderr, "PASS probe mode=%ls cycles=%d\n", mode, cycles);
   return 0;
@@ -525,7 +532,28 @@ static int consumer(uint32_t pid, const wchar_t *mode) {
   return 0;
 }
 #endif
+// Wine does not reliably forward either process's stderr to Proton's log.
+// Each process owns a separate file in a fresh launcher-created directory.
+static bool open_diagnostic_log() {
+  const wchar_t *directory = _wgetenv(L"TWFG_PROBE_LOG_DIR");
+  if (!directory || !*directory)
+    return false;
+#ifdef _WIN64
+  const wchar_t *role = L"consumer";
+#else
+  const wchar_t *role = L"producer";
+#endif
+  std::wstring path = std::wstring(directory) + L"\\" + role + L"-" +
+                      std::to_wstring(GetCurrentProcessId()) + L".log";
+  return _wfreopen(path.c_str(), L"wb", stderr) != nullptr;
+}
+
 int wmain(int argc, wchar_t **argv) {
+  if (!open_diagnostic_log()) {
+    // Exit status remains observable even if Wine drops this diagnostic.
+    fprintf(stderr, "FAIL resource=diagnostic-log API=open error=%d\n", errno);
+    return 3;
+  }
   setvbuf(stderr, nullptr, _IONBF, 0);
   try {
 #ifndef _WIN64

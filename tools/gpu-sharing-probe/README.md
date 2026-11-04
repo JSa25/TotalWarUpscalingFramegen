@@ -37,7 +37,7 @@ export STEAM_COMPAT_DATA_PATH='/mnt/games/SteamLibrary/steamapps/compatdata/3256
 # An agent/terminal may not inherit the graphical session's WAYLAND_DISPLAY.
 # Export the actual session value if absent; do not guess a socket.
 export WAYLAND_DISPLAY=wayland-1 # example: inspect /run/user/$UID/wayland-*
-export PROBE_RESULTS=/tmp/twfg-probe-results
+export PROBE_RESULTS=/tmp/twfg-probe-results # must not already exist
 bash tools/gpu-sharing-probe/check.sh
 ```
 
@@ -50,6 +50,22 @@ acceptance in the player's prefix. `STEAM_COMPAT_CLIENT_INSTALL_PATH` can overri
 the default `$HOME/.local/share/Steam`.
 
 For one case, use `bash tools/gpu-sharing-probe/run.sh rgba 3 normal`.
+Without `PROBE_LOG_DIR`, the launcher creates a fresh `build/run-*` directory and
+prints its path. Set `PROBE_LOG_DIR` to choose the output directory; its
+`process-logs/` subdirectory must not already exist. Reusing a run directory is
+rejected, including after an interrupted run. The full suite likewise requires
+a new `PROBE_RESULTS` directory.
+
+The launcher exports `TWFG_PROBE_LOG_DIR` as a Windows `Z:` path. Before doing
+GPU work, each executable redirects stderr to its own `producer-<pid>.log` or
+`consumer-<pid>.log` there; failure to open the file exits with status 3.
+Both peers inherit the directory but write separate files. Direct executable
+invocations must also set this variable to an existing writable Windows path.
+`check.sh` requires one producer and three consumer logs per case, builds its
+CRLF-normalized `combined.log` only from those current process logs, and applies
+all content, failure and named-baseline assertions to them. `launcher.log` and
+raw `steam-325610.log` remain separate diagnostics; successful process exit or
+PASS lines in Proton output alone do not establish acceptance.
 The full suite covers both RGBA8 and BGRA8 colour formats, three recreated
 resource generations each, plus missing/invalid mapping, invalid duplicated
 handle (after earlier successful imports), and injected partial initialization
@@ -99,7 +115,11 @@ nonzero and includes a resource, operation and error code. Check for leftover
 processes after an outer timeout before another run.
 
 RAII closes source/duplicated/process/event/mapping handles and COM objects on
-success and partial failures. Per-cycle producer process handle counts reject
-growth after the first lazy-driver warmup cycle. Consumer process exit also
-provides an OS cleanup boundary; this does not establish production restart
-correctness. The separate full game/helper bridge test remains required.
+success and partial failures. Per-cycle producer process handle counts are
+advisory: when both counts are nonzero, growth after the first lazy-driver
+warmup cycle is rejected. Zero counts are reported as unavailable. The target
+Proton returns zero from its stubbed process-handle-count query, so passing this
+suite provides no process handle leak check there. RAII cleanup is source-level
+assurance; the probe does not verify cleanup API return values. Consumer process
+exit also provides an OS cleanup boundary; this does not establish production
+restart correctness. The separate full game/helper bridge test remains required.
