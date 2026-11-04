@@ -87,8 +87,12 @@ and verifies every pixel byte. A handshake keeps the consumer device alive until
 return verification, avoiding device teardown completing shared fences early.
 
 Require `PASS probe mode=normal cycles=3`, all texture assertions, matching
-adapter identity, and all negative cases. A named baseline can succeed on Windows;
-record the HRESULT rather than presuming failure. Each GPU/IPC wait is bounded
+adapter identity, and all negative cases. On the target Proton stack, `check.sh`
+also requires the named baseline to return `E_NOTIMPL` (`0x80004001`) in all three
+normal cycles, reproducing the original failure before accepting the workaround.
+The executable remains a general diagnostic: it records the baseline HRESULT
+and can succeed on Windows when the named opening succeeds. Such a result, or
+any other baseline failure, does not satisfy the Proton suite. Each GPU/IPC wait is bounded
 (10 seconds, child readiness up to 40 seconds); the Linux launcher adds a 180
 second outer timeout with forced termination after 10 seconds. Every error is
 nonzero and includes a resource, operation and error code. Check for leftover

@@ -9,7 +9,8 @@ for colour in rgba bgra; do
     dest="$PROBE_RESULTS/$colour-$mode"
     mkdir -p "$dest"
     PROBE_LOG_DIR="$dest" bash run.sh "$colour" 3 "$mode" > "$dest/launcher.log" 2>&1
-    cat "$dest/launcher.log" "$dest/steam-325610.log" > "$dest/combined.log"
+    # Windows stderr can contain CRLF; preserve raw logs and normalize for checks.
+    cat "$dest/launcher.log" "$dest/steam-325610.log" | tr -d '\r' > "$dest/combined.log"
     rg -q "PASS probe mode=$mode cycles=3" "$dest/combined.log"
     if [[ $mode == normal ]]; then
       for pair in final:11 hudless:22 depth:33 motion:44 srout0:55 srout1:66 reactive:77; do
@@ -20,7 +21,7 @@ for colour in rgba bgra; do
         resource=${pair%:*}; expected=${pair#*:}
         [[ $(rg -c "PASS contents resource=$resource expected=0x$expected" "$dest/combined.log") == 3 ]]
       done
-      [[ $(rg -c 'BASELINE resource=game-fence API=OpenSharedHandleByName HRESULT=' "$dest/combined.log") == 3 ]]
+      [[ $(rg -c '^BASELINE resource=game-fence API=OpenSharedHandleByName HRESULT=0x80004001$' "$dest/combined.log") == 3 ]]
     else
       [[ $(rg -c "PASS expected failure mode=$mode exit=20" "$dest/combined.log") == 3 ]]
     fi
