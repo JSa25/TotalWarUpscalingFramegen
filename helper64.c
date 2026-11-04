@@ -16,6 +16,7 @@
 #include "proto.h"
 #include "present12.h"
 #include "fgb_proto.h"
+#include "fgb_handles.h"
 
 static P1Header *hdr;
 static uint8_t *ring, *heap, *arena;
@@ -762,6 +763,43 @@ static DWORD WINAPI bridge_present_thread(void *arg)
     }
 }
 
+/* Returns 0 for an old peer, 1 for duplicated handles, -1 for a broken sidecar.
+   All mapping/process handles are initialization-scoped; caller owns duplicates. */
+static int bridge_handles(DWORD pid, HANDLE local[FGB_HANDLE_COUNT])
+{
+    wchar_t name[64];
+    swprintf(name, 64, L"Local\\fgb_%lu_handles", (unsigned long)pid);
+    HANDLE map = OpenFileMappingW(FILE_MAP_READ, FALSE, name);
+    if (!map) {
+        DWORD e = GetLastError();
+        if (e == ERROR_FILE_NOT_FOUND) { fprintf(stderr, "helper64 bridge: no handle sidecar; named transport\n"); return 0; }
+        fprintf(stderr, "helper64 bridge: OpenFileMapping handles error=%lu\n", e); return -1;
+    }
+    const FgbHandles *view = MapViewOfFile(map, FILE_MAP_READ, 0, 0, sizeof(FgbHandles));
+    FgbHandles data;
+    if (!view) { fprintf(stderr, "helper64 bridge: MapViewOfFile handles error=%lu\n", GetLastError()); CloseHandle(map); return -1; }
+    memcpy(&data, view, sizeof data);
+    UnmapViewOfFile(view); CloseHandle(map);
+    if (data.version != FGB_HANDLES_VERSION || data.size != sizeof data || data.pid != pid || data.count != FGB_HANDLE_COUNT) {
+        fprintf(stderr, "helper64 bridge: invalid handle sidecar version=%u size=%u pid=%u count=%u\n", data.version, data.size, data.pid, data.count); return -1;
+    }
+    HANDLE game = OpenProcess(PROCESS_DUP_HANDLE, FALSE, pid);
+    if (!game) { fprintf(stderr, "helper64 bridge: OpenProcess(PROCESS_DUP_HANDLE) error=%lu\n", GetLastError()); return -1; }
+    static const char *const resource[FGB_HANDLE_COUNT] = { "fence", "fsr", "fdone", "final", "hudless", "depth", "mvec", "srout0", "srout1", "react" };
+    int ok = 1;
+    for (unsigned i = 0; i < FGB_HANDLE_COUNT; ++i) {
+        if (!data.handles[i] && i == 9) continue;
+        if (!data.handles[i]) { fprintf(stderr, "helper64 bridge: missing source handle resource=%s\n", resource[i]); ok = 0; break; }
+        if (!DuplicateHandle(game, (HANDLE)(uintptr_t)data.handles[i], GetCurrentProcess(), &local[i], 0, FALSE, DUPLICATE_SAME_ACCESS)) {
+            fprintf(stderr, "helper64 bridge: DuplicateHandle resource=%s error=%lu\n", resource[i], GetLastError()); ok = 0; break;
+        }
+    }
+    CloseHandle(game);
+    if (!ok) { for (unsigned i = 0; i < FGB_HANDLE_COUNT; ++i) if (local[i]) { CloseHandle(local[i]); local[i] = NULL; } return -1; }
+    fprintf(stderr, "helper64 bridge: duplicated-handle transport\n");
+    return 1;
+}
+
 static int bridge_main(int argc, char **argv)
 {
     if (argc < 5) { fprintf(stderr, "usage: helper64 bridge <game pid> <streamline dir> <log dir>\n"); return 1; }
@@ -802,8 +840,13 @@ static int bridge_main(int argc, char **argv)
     for (int i = 0; i < 9; i++) objs[i] = names[2 + i];
     p12_set_fg_test_limit(sh->fg_test_limit);
     p12_set_tech(sh->tech);
-    if (!p12_bridge_init(sh->luid_lo, sh->luid_hi, (HWND)(uintptr_t)sh->hwnd, sh->width, sh->height, objs, sl_dir,
-                         log_dir[0] ? log_dir : NULL)) { sh->error = 1; return 3; }
+    HANDLE imported[FGB_HANDLE_COUNT] = {0};
+    int transport = bridge_handles(pid, imported);
+    if (transport < 0) { sh->error = 1; return 3; }
+    int initialized = p12_bridge_init(sh->luid_lo, sh->luid_hi, (HWND)(uintptr_t)sh->hwnd, sh->width, sh->height, objs, transport ? imported : NULL, sl_dir,
+                         log_dir[0] ? log_dir : NULL);
+    for (unsigned i = 0; i < FGB_HANDLE_COUNT; ++i) if (imported[i]) CloseHandle(imported[i]);
+    if (!initialized) { sh->error = 1; return 3; }
     sh->fg_max = p12_fg_max();   /* the game reads it once helper_ok is set */
     b_n0 = b_started = sh->done;   /* a helper started after another one goes on from its last frame */
     if (b_n0) fprintf(stderr, "  started after another helper: from frame %u\n", b_n0);

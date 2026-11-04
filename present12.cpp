@@ -438,47 +438,55 @@ extern "C" int p12_init(ID3D11Device *d11, ID3D11DeviceContext *ctx11, HWND hwnd
 
 /* bridge path: the game's D3D11 device (another process) created the fence and the textures under these names:
    fence, final colour (with UI), HUD-less colour, depth (R32F), motion vectors (RG16F, pixels) */
-extern "C" int p12_bridge_init(uint32_t luid_lo, int32_t luid_hi, HWND hwnd, uint32_t w, uint32_t h, const wchar_t *const names[9],
+extern "C" int p12_bridge_init(uint32_t luid_lo, int32_t luid_hi, HWND hwnd, uint32_t w, uint32_t h, const wchar_t *const names[9], const HANDLE imported[10],
                                const wchar_t *sl_dir, const wchar_t *log_dir)
 {
     LUID luid = { luid_lo, luid_hi };
     if (!init_core(&luid, hwnd, w, h, sl_dir, log_dir)) return 0;
-    HANDLE hh;
+    // imported handles are borrowed for this call; helper64 closes them on every outcome.
     ID3D12Fence **fences[3] = { &f_game, &f_sr, &f_done };
-    for (int i = 0; i < 3; i++) {
-        if (FAILED(d12->OpenSharedHandleByName(names[i], GENERIC_ALL, &hh)) ||
-            FAILED(d12->OpenSharedHandle(hh, __uuidof(ID3D12Fence), (void **)fences[i]))) {
-            fprintf(stderr, "p12: open game fence %ls\n", names[i]); return 0;
-        }
-        CloseHandle(hh);
-    }
-    for (int i = 0; i < 6; i++) {
-        if (FAILED(d12->OpenSharedHandleByName(names[3 + i], GENERIC_ALL, &hh)) ||
-            FAILED(d12->OpenSharedHandle(hh, __uuidof(ID3D12Resource), (void **)&br[i]))) {
-            fprintf(stderr, "p12: open game texture %ls\n", names[3 + i]); return 0;
-        }
-        CloseHandle(hh);
-    }
-    {   // optional: "react" beside the others (names[3] ends in "final"); FGB_FSR_NOREACT: not used (A/B)
-        wchar_t rn[64];
-        lstrcpynW(rn, names[3], 64);
-        wchar_t *s = wcsstr(rn, L"_final");
-        if (s && !dev_getenv("FGB_FSR_NOREACT")) {
-            lstrcpyW(s, L"_react");
-            if (SUCCEEDED(d12->OpenSharedHandleByName(rn, GENERIC_ALL, &hh))) {
-                if (FAILED(d12->OpenSharedHandle(hh, __uuidof(ID3D12Resource), (void **)&br_react))) br_react = nullptr;
-                CloseHandle(hh);
+    const char *resource[10] = { "fence", "fsr", "fdone", "final", "hudless", "depth", "mvec", "srout0", "srout1", "react" };
+    auto release_imports = [&]() {
+        for (auto f : fences) if (*f) { (*f)->Release(); *f = nullptr; }
+        for (auto &r : br) if (r) { r->Release(); r = nullptr; }
+        if (br_react) { br_react->Release(); br_react = nullptr; }
+    };
+    for (int i = 0; i < 10; ++i) {
+        if (i == 9 && dev_getenv("FGB_FSR_NOREACT")) continue;
+        HANDLE hh = imported ? imported[i] : nullptr;
+        HRESULT hr = S_OK;
+        const char *op = "OpenSharedHandle";
+        if (!imported) {
+            wchar_t rn[64];
+            const wchar_t *name = i < 9 ? names[i] : rn;
+            if (i == 9) {
+                lstrcpynW(rn, names[3], 64);
+                wchar_t *suffix = wcsstr(rn, L"_final");
+                if (!suffix) continue;
+                lstrcpyW(suffix, L"_react");
             }
+            op = "OpenSharedHandleByName";
+            hr = d12->OpenSharedHandleByName(name, GENERIC_ALL, &hh);
         }
-        fprintf(stderr, "  p12: AMD FSR reactive mask: %s\n", br_react ? "from the game" : "none");
+        if (SUCCEEDED(hr) && hh) {
+            op = "OpenSharedHandle";
+            hr = i < 3 ? d12->OpenSharedHandle(hh, __uuidof(ID3D12Fence), (void **)fences[i])
+                        : d12->OpenSharedHandle(hh, __uuidof(ID3D12Resource), i == 9 ? (void **)&br_react : (void **)&br[i - 3]);
+        } else if (SUCCEEDED(hr) && i < 9) hr = E_HANDLE;
+        if (!imported && hh) CloseHandle(hh);
+        if (FAILED(hr)) {
+            fprintf(stderr, "p12: resource=%s operation=%s HRESULT=0x%08lx%s\n", resource[i], op, (unsigned long)hr, i == 9 ? " (optional)" : "");
+            if (i != 9) { release_imports(); return 0; }
+        }
     }
+    fprintf(stderr, "  p12: AMD FSR reactive mask: %s\n", br_react ? "from the game" : "none");
     D3D12_COMMAND_QUEUE_DESC qd = { D3D12_COMMAND_LIST_TYPE_DIRECT, 0, D3D12_COMMAND_QUEUE_FLAG_NONE, 0 };
     if (FAILED(d12->CreateCommandQueue(&qd, __uuidof(ID3D12CommandQueue), (void **)&queue_sr)) ||
         FAILED(d12->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, sr_alloc[0], nullptr, __uuidof(ID3D12GraphicsCommandList),
-                                      (void **)&cl_sr))) { fprintf(stderr, "p12: SR queue\n"); return 0; }
+                                      (void **)&cl_sr))) { fprintf(stderr, "p12: SR queue\n"); release_imports(); return 0; }
     cl_sr->Close();
     sr_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    if (ffx_fg && !init_fsr_fg(hwnd)) return 0;
+    if (ffx_fg && !init_fsr_fg(hwnd)) { release_imports(); return 0; }
     init_tail();
     return 1;
 }
@@ -1071,4 +1079,9 @@ extern "C" void p12_shutdown(void)
     if (ffx_fg) { ffx_shutdown(); sc = nullptr; }   // AMD's swapchain: AMD's code releases it
     if (sc) { sc->Release(); sc = nullptr; }
     if (sl_on) p_slShutdown();
+    for (auto &r : br) if (r) { r->Release(); r = nullptr; }
+    if (br_react) { br_react->Release(); br_react = nullptr; }
+    if (f_game) { f_game->Release(); f_game = nullptr; }
+    if (f_sr) { f_sr->Release(); f_sr = nullptr; }
+    if (f_done) { f_done->Release(); f_done = nullptr; }
 }
