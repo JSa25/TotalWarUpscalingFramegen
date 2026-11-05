@@ -1014,7 +1014,10 @@ static int present_fsr(uint32_t n, int reset, int sr_done, int hud_post)
     HRESULT hr = sc->Present(sync, sync ? 0 : DXGI_PRESENT_ALLOW_TEARING);
     QueryPerformanceCounter(&t1);
     st_present_t += (t1.QuadPart - t0.QuadPart);
-    if (FAILED(hr)) st_present_fail++;
+    if (FAILED(hr)) {
+        st_present_fail++;
+        fprintf(stderr, "p12: AMD Present frame %u reset %d failed (0x%08lx)\n", n, reset, (unsigned long)hr);
+    }
     st_presents++;
     uint32_t shown = on && !reset ? 2 : 1;   // estimate: AMD's swapchain shows the generated frame before each real one
     st_frames_shown += shown; st_shown_total += shown; st_shown_hist[shown]++;
@@ -1039,10 +1042,10 @@ extern "C" uint32_t p12_shown_total(void) { return st_shown_total; }
 
 extern "C" void p12_stats(char *buf, size_t len, int reset)
 {
-    snprintf(buf, len, "presents %u, frames shown %u (%.2f per present; per-present count 0:%u 1:%u 2:%u 3:%u 4:%u >4:%u), "
+    snprintf(buf, len, "presents %u, %s %u (%.2f per present; per-present count 0:%u 1:%u 2:%u 3:%u 4:%u >4:%u), "
              "bad status %u (last 0x%x), tag failures %u, present failures %u, mode %u, helper CPU %.3f ms/present "
              "(waiting for the GPU %.3f, inside Present %.3f), DLSS SR GPU %.3f ms (%u), V-Sync on %u / off %u, HUD-less from the game after SR %u",
-             st_presents, st_frames_shown, st_presents ? (double)st_frames_shown / st_presents : 0,
+             st_presents, ffx_fg ? "estimated frames shown" : "frames shown", st_frames_shown, st_presents ? (double)st_frames_shown / st_presents : 0,
              st_shown_hist[0], st_shown_hist[1], st_shown_hist[2], st_shown_hist[3], st_shown_hist[4], st_shown_hist[5],
              st_bad_status, st_last_status, st_tag_fail, st_present_fail, fg_frames, st_presents ? st_cpu_ms / st_presents : 0,
              st_presents ? st_slot_t * st_tick_ms / st_presents : 0, st_presents ? st_present_t * st_tick_ms / st_presents : 0,
