@@ -20,8 +20,9 @@ void p12_set_sr_preset(uint32_t preset);             /* DLSS preset for the next
 void p12_set_sr(int on, uint32_t render_w, uint32_t render_h, float jitter_sign);   /* DLSS SR (Quality) */
 void p12_set_jitter(float x, float y);                 /* this frame's jitter in render pixels (x right, y down) */
 void p12_set_dump(uint32_t frame, const char *path);   /* write <path>_out.ppm (and _in.ppm with SR) at that frame */
-int  p12_bridge_init(uint32_t luid_lo, int32_t luid_hi, HWND hwnd, uint32_t w, uint32_t h, const wchar_t *const names[9],
-                     const wchar_t *sl_dir, const wchar_t *log_dir);   /* names: fences game / SR / done, final, HUD-less, depth, motion vectors, SR output 0 / 1 */
+int  p12_bridge_init(uint32_t luid_lo, int32_t luid_hi, HWND hwnd, uint32_t w, uint32_t h, const wchar_t *const names[9], const HANDLE imported[10],
+                     const wchar_t *sl_dir, const wchar_t *log_dir);   /* names: game/SR/done fences, final, HUD-less, depth, motion vectors, SR outputs 0/1.
+                        imported: optional ten borrowed local handles in that order, plus reactive mask; NULL uses names. */
 int  p12_bridge_frame(uint32_t frame, int reset, int sr);   /* SR thread: start frame n; with sr, DLSS SR (game 2n+1 -> SR fence n+1) */
 void p12_set_fg_test_limit(uint32_t limit);   /* before init: dev test, 0 none, else the GPU is treated as allowing limit - 1 */
 uint32_t p12_fg_max(void);                    /* after init: generated frames this GPU allows (0 = no frame generation) */

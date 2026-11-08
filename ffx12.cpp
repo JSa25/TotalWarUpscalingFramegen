@@ -23,6 +23,7 @@
 static ffxFunctions fx;
 static ffxContext sr_ctx, fg_ctx, sc_ctx;
 static IDXGISwapChain4 *fg_sc;
+static int fg_log_reset = -1, fg_log_on = -1;
 static char sr_ver[64] = "?", fg_ver[64] = "?";
 static float mvs = 1, meters = 1;   // dev test FGB_FSR_MVSIGN: the motion vector sign
 static float rcas = -1;            // FSR's own sharpening (RCAS) 0..1, off below 0 (FGB_FSR_RCAS, AGENT_LOG 183)
@@ -132,7 +133,12 @@ int ffx_sr_dispatch(ID3D12GraphicsCommandList *cl, ID3D12Resource *color, ID3D12
 
 static ffxReturnCode_t fg_dispatch(ffxDispatchDescFrameGeneration *p, void *ctx)
 {
-    return fx.Dispatch((ffxContext *)ctx, &p->header);
+    static volatile LONG calls;
+    LONG call = InterlockedIncrement(&calls);
+    ffxReturnCode_t result = fx.Dispatch((ffxContext *)ctx, &p->header);
+    if (result != FFX_API_RETURN_OK || call == 1 || call % 1000 == 0)
+        fprintf(stderr, "ffx: FG generation callback call %ld result %u (activity only; output not verified)\n", call, result);
+    return result;
 }
 
 IDXGISwapChain4 *ffx_fg_create(ID3D12Device *dev, ID3D12CommandQueue *queue, IDXGIFactory *fac, HWND hwnd, uint32_t w,
@@ -185,6 +191,10 @@ IDXGISwapChain4 *ffx_fg_create(ID3D12Device *dev, ID3D12CommandQueue *queue, IDX
 int ffx_fg_frame(ID3D12GraphicsCommandList *cl, uint64_t frame_id, int on, ID3D12Resource *hudless, ID3D12Resource *depth,
                             ID3D12Resource *mvec, uint32_t rw, uint32_t rh, float jx, float jy, int reset, const CamVp *cam, float dt_ms)
 {
+    // Report state changes and periodic samples without flooding the log during long resets.
+    bool log_frame = fg_log_reset != (reset != 0) || fg_log_on != (on != 0) || frame_id % 1000 == 0;
+    fg_log_reset = reset != 0;
+    fg_log_on = on != 0;
     D3D12_RESOURCE_DESC hd = hudless->GetDesc();
     ffxConfigureDescFrameGeneration c{};
     c.header.type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION;
@@ -198,7 +208,11 @@ int ffx_fg_frame(ID3D12GraphicsCommandList *cl, uint64_t frame_id, int on, ID3D1
     c.HUDLessColor = ffxApiGetResourceDX12(hudless, FFX_API_RESOURCE_STATE_GENERIC_READ);
     c.generationRect = { 0, 0, (int32_t)hd.Width, (int32_t)hd.Height };
     c.frameID = frame_id;
-    if (fx.Configure(&fg_ctx, &c.header) != FFX_API_RETURN_OK) return 0;
+    ffxReturnCode_t configured = fx.Configure(&fg_ctx, &c.header);
+    if (configured != FFX_API_RETURN_OK || log_frame)
+        fprintf(stderr, "ffx: FG configure frame %llu enabled %d reset %d result %u\n",
+                (unsigned long long)frame_id, on, reset, configured);
+    if (configured != FFX_API_RETURN_OK) return 0;
     if (!on) return 1;
     ffxDispatchDescFrameGenerationPrepareV2 p{};
     p.header.type = FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE_V2;
@@ -215,11 +229,16 @@ int ffx_fg_frame(ID3D12GraphicsCommandList *cl, uint64_t frame_id, int on, ID3D1
     p.motionVectors = ffxApiGetResourceDX12(mvec, FFX_API_RESOURCE_STATE_GENERIC_READ);
     memcpy(p.cameraPosition, cam->pos, 12); memcpy(p.cameraUp, cam->up, 12);
     memcpy(p.cameraRight, cam->right, 12); memcpy(p.cameraForward, cam->fwd, 12);
-    return fx.Dispatch(&fg_ctx, &p.header) == FFX_API_RETURN_OK;
+    ffxReturnCode_t prepared = fx.Dispatch(&fg_ctx, &p.header);
+    if (prepared != FFX_API_RETURN_OK || log_frame)
+        fprintf(stderr, "ffx: FG prepare frame %llu reset %d result %u\n",
+                (unsigned long long)frame_id, reset, prepared);
+    return prepared == FFX_API_RETURN_OK;
 }
 
 void ffx_shutdown(void)
 {
+    fg_log_reset = fg_log_on = -1;
     if (fg_ctx) {   // AMD: frame generation off and its context destroyed before the swapchain
         ffxConfigureDescFrameGeneration c{};
         c.header.type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION;
