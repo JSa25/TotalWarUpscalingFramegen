@@ -52,8 +52,9 @@ def main():
             try:
                 target = dest / f'{i:02d}-{path.name}'
                 shutil.copyfile(path, target)
-                entry.update(copy=str(target.relative_to(args.output)),
-                             sha256=hashlib.sha256(target.read_bytes()).hexdigest())
+                with open(target, 'rb') as hashed:
+                    entry.update(copy=str(target.relative_to(args.output)),
+                                 sha256=hashlib.file_digest(hashed, 'sha256').hexdigest())
             except OSError as exc:
                 entry['error'] = str(exc)
             record['evidence'].append(entry)
